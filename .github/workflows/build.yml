@@ -1,0 +1,45 @@
+# Builds the editor on every push / pull request, and publishes a GitHub Release
+# with IRR-InventoryEditor.zip whenever a tag like v1.2.0 is pushed.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with the C# compiler that ships with Windows
+        shell: cmd
+        run: build.bat
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg/IRR-InventoryEditor | Out-Null
+          Copy-Item IRR-InventoryEditor.exe, README.md, LICENSE pkg/IRR-InventoryEditor
+          Compress-Archive -Path pkg/IRR-InventoryEditor -DestinationPath IRR-InventoryEditor.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IRR-InventoryEditor
+          path: IRR-InventoryEditor.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = if (Test-Path "docs/release-notes/$tag.md") { "docs/release-notes/$tag.md" } else { $null }
+          if ($notes) { gh release create $tag IRR-InventoryEditor.zip --title "IRR Inventory Editor $tag" --notes-file $notes }
+          else { gh release create $tag IRR-InventoryEditor.zip --title "IRR Inventory Editor $tag" --generate-notes }

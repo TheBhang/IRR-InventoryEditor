@@ -9,6 +9,43 @@ namespace IrrEditor
 {
     public static class Theme
     {
+        // ---- DPI: the exe is DPI-aware (manifest), so pixel sizes are scaled by hand / AutoScale
+        static float scale = 0;
+        public static float Scale
+        {
+            get
+            {
+                if (scale == 0)
+                {
+                    try { using (var g = Graphics.FromHwnd(IntPtr.Zero)) scale = Math.Max(1f, g.DpiX / 96f); }
+                    catch { scale = 1f; }
+                }
+                return scale;
+            }
+        }
+        /// <summary>Scale a 96-dpi pixel value to the current display.</summary>
+        public static int S(int px) { return (int)Math.Round(px * Scale); }
+        /// <summary>Make a form scale its 96-dpi pixel sizes to the display (call first in the constructor).
+        /// WinForms' own AutoScale doesn't kick in for forms built in code, so scale explicitly on Load.</summary>
+        public static void DpiForm(Form f)
+        {
+            f.AutoScaleMode = AutoScaleMode.None;
+            f.Load += delegate
+            {
+                if (Math.Abs(Scale - 1f) < 0.01f) return;
+                f.Scale(new SizeF(Scale, Scale));
+                ScaleExtras(f);
+            };
+        }
+
+        // things Control.Scale doesn't touch: ListView columns, grid row heights
+        static void ScaleExtras(Control c)
+        {
+            var lv = c as ListView;
+            if (lv != null) foreach (ColumnHeader h in lv.Columns) h.Width = (int)(h.Width * Scale);
+            foreach (Control ch in c.Controls) ScaleExtras(ch);
+        }
+
         public static readonly Color Bg = Color.FromArgb(24, 26, 29);        // window background
         public static readonly Color Panel = Color.FromArgb(32, 34, 38);     // side panels
         public static readonly Color Surface = Color.FromArgb(42, 45, 50);   // inputs, headers
@@ -63,7 +100,21 @@ namespace IrrEditor
                 var t = (TreeView)c; t.BackColor = Panel; t.ForeColor = Text; t.LineColor = Border; t.BorderStyle = BorderStyle.None;
                 DarkNative(t); return;
             }
-            if (c is ListBox) { var l = (ListBox)c; l.BackColor = Surface; l.ForeColor = Text; l.BorderStyle = BorderStyle.None; DarkNative(l); return; }
+            if (c is ListBox)
+            {
+                var l = (ListBox)c; l.BackColor = Surface; l.ForeColor = Text; l.BorderStyle = BorderStyle.None; DarkNative(l);
+                // gold selection instead of the system blue
+                l.DrawMode = DrawMode.OwnerDrawFixed; l.ItemHeight = (int)(l.Font.GetHeight() + S(6));
+                l.DrawItem += (s, e) =>
+                {
+                    if (e.Index < 0) return;
+                    bool sel = (e.State & DrawItemState.Selected) != 0;
+                    using (var b = new SolidBrush(sel ? AccentBg : l.BackColor)) e.Graphics.FillRectangle(b, e.Bounds);
+                    TextRenderer.DrawText(e.Graphics, Convert.ToString(l.Items[e.Index]), l.Font, new Rectangle(e.Bounds.X + S(4), e.Bounds.Y, e.Bounds.Width - S(4), e.Bounds.Height), sel ? Color.White : Text,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.PreserveGraphicsClipping);
+                };
+                return;
+            }
             if (c is ListView) { var l = (ListView)c; l.BackColor = Panel; l.ForeColor = Text; l.BorderStyle = BorderStyle.None; DarkNative(l); return; }
             if (c is TextBox) { var t = (TextBox)c; t.BackColor = Surface; t.ForeColor = Text; t.BorderStyle = BorderStyle.FixedSingle; return; }
             if (c is ComboBox)
@@ -104,6 +155,7 @@ namespace IrrEditor
             g.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(46, 49, 55);
             g.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
             DarkNative(g);
+            foreach (Control sb in g.Controls) DarkNative(sb);   // its scrollbars are child windows
         }
 
         class DarkColors : ProfessionalColorTable
@@ -284,6 +336,89 @@ namespace IrrEditor
         protected override void OnLeave(EventArgs e) { base.OnLeave(e); syncing = true; Text = Format(val); syncing = false; }
     }
 
+    /// <summary>Dark one-line text prompt.</summary>
+    public static class DarkInput
+    {
+        public static string Show(IWin32Window owner, string prompt, string caption, string value)
+        {
+            using (var f = new Form())
+            {
+                Theme.DpiForm(f);
+                f.Text = caption; f.FormBorderStyle = FormBorderStyle.FixedDialog; f.MinimizeBox = false; f.MaximizeBox = false; f.ShowInTaskbar = false;
+                f.StartPosition = FormStartPosition.CenterParent; f.Font = new Font("Segoe UI", 9.5f);
+                f.ClientSize = new Size(420, 130);
+                var l = new Label { Text = prompt, Left = 16, Top = 14, AutoSize = true };
+                var t = new TextBox { Text = value, Left = 16, Top = 40, Width = 388 };
+                var ok = Theme.MakeButton("OK", DialogResult.OK, true);
+                var cancel = Theme.MakeButton(L.T("Zrušit", "Cancel"), DialogResult.Cancel, false);
+                ok.Location = new Point(308, 82); cancel.Location = new Point(204, 82);
+                f.Controls.AddRange(new Control[] { l, t, ok, cancel });
+                f.AcceptButton = ok; f.CancelButton = cancel;
+                Theme.Apply(f);
+                ok.BackColor = Theme.AccentBg; ok.FlatAppearance.BorderColor = Theme.Accent;
+                return f.ShowDialog(owner) == DialogResult.OK ? t.Text : null;
+            }
+        }
+    }
+
+    /// <summary>Dark horizontal slider (the native TrackBar can't be themed).</summary>
+    public class DarkSlider : Control
+    {
+        int min = 1, max = 100, val = 1;
+        bool dragging;
+        public event EventHandler ValueChanged;
+        public int Minimum { get { return min; } set { min = value; if (max < min) max = min; Value = val; Invalidate(); } }
+        public int Maximum { get { return max; } set { max = Math.Max(min, value); Value = val; Invalidate(); } }
+        public int Value
+        {
+            get { return val; }
+            set
+            {
+                int v = Math.Max(min, Math.Min(max, value));
+                if (v == val) return;
+                val = v; Invalidate();
+                if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+            }
+        }
+        public DarkSlider()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            Height = 28; TabStop = true; Cursor = Cursors.Hand;
+        }
+        int Pad { get { return Height / 2; } }
+        float Frac { get { return max == min ? 0 : (float)(val - min) / (max - min); } }
+        void SetFromX(int x)
+        {
+            float f = Math.Max(0, Math.Min(1, (float)(x - Pad) / Math.Max(1, Width - 2 * Pad)));
+            Value = min + (int)Math.Round(f * (max - min));
+        }
+        protected override void OnMouseDown(MouseEventArgs e) { Focus(); dragging = true; SetFromX(e.X); }
+        protected override void OnMouseMove(MouseEventArgs e) { if (dragging) SetFromX(e.X); }
+        protected override void OnMouseUp(MouseEventArgs e) { dragging = false; }
+        protected override void OnMouseWheel(MouseEventArgs e) { Value += e.Delta > 0 ? Math.Max(1, (max - min) / 20) : -Math.Max(1, (max - min) / 20); }
+        protected override bool IsInputKey(Keys k) { return k == Keys.Left || k == Keys.Right || base.IsInputKey(k); }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Left) Value--; else if (e.KeyCode == Keys.Right) Value++;
+            else if (e.KeyCode == Keys.Home) Value = min; else if (e.KeyCode == Keys.End) Value = max;
+            base.OnKeyDown(e);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics; g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            int y = Height / 2, x0 = Pad, x1 = Width - Pad;
+            int tx = x0 + (int)((x1 - x0) * Frac);
+            using (var p = new Pen(Theme.SurfaceHi, Math.Max(4, Height / 6))) { p.StartCap = p.EndCap = System.Drawing.Drawing2D.LineCap.Round; g.DrawLine(p, x0, y, x1, y); }
+            using (var p = new Pen(Theme.Accent, Math.Max(4, Height / 6))) { p.StartCap = p.EndCap = System.Drawing.Drawing2D.LineCap.Round; if (tx > x0) g.DrawLine(p, x0, y, tx, y); }
+            int r = Height / 3;
+            using (var b = new SolidBrush(Focused ? Color.White : Theme.Text)) g.FillEllipse(b, tx - r, y - r, 2 * r, 2 * r);
+            using (var p = new Pen(Theme.Accent, 2)) g.DrawEllipse(p, tx - r, y - r, 2 * r, 2 * r);
+        }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    }
+
     /// <summary>Drop-in dark replacement for MessageBox.Show.</summary>
     public static class DarkMsg
     {
@@ -296,6 +431,7 @@ namespace IrrEditor
         {
             using (var f = new Form())
             {
+                Theme.DpiForm(f);
                 f.Text = caption; f.FormBorderStyle = FormBorderStyle.FixedDialog; f.MinimizeBox = false; f.MaximizeBox = false; f.ShowInTaskbar = false;
                 f.StartPosition = owner == null ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
                 f.Font = new Font("Segoe UI", 9.5f); f.AutoSize = true; f.AutoSizeMode = AutoSizeMode.GrowAndShrink; f.Padding = new Padding(18);

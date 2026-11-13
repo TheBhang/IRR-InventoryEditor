@@ -1,9 +1,8 @@
-// WinForms UI for the Incursion Red River inventory editor.
+// Main window of the Incursion Red River inventory editor.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -13,42 +12,63 @@ namespace IrrEditor
 {
     public class MainForm : Form
     {
+        // ------------------------------------------------------------------ state
         string dir;
         InvSave stash, inv, vendor;
         BaseData baseData;
-        MainContainer curMC;
-        InvItem selItem;
-        readonly Stack<MainContainer> history = new Stack<MainContainer>();
+        SaveDoc gunsmith;
+        MainContainer curMC;                 // active grid container: target for Add / Sort / Merge
+        InvItem selItem;                     // primary selection (multi-selection lives in grid.Multi)
 
+        enum ViewKind { Container, Loadout, StashAll }
+        class ViewRef { public ViewKind Kind; public MainContainer Mc; }
+        ViewKind view = ViewKind.StashAll;
+        MainContainer viewMc;
+        readonly Stack<ViewRef> history = new Stack<ViewRef>();
+        UndoStack undo;
+        Dictionary<string, DateTime> stamps = new Dictionary<string, DateTime>();
+
+        // ------------------------------------------------------------------ controls
         TreeView tree;
         GridPanel grid;
-        Label gridTitle;
+        Label gridTitle, gridStats;
         Button btnBack;
-        // details
         Label lblName, lblInfo;
         TextBox txtDef;
         NumBox numCount, numMax;
         CheckBox chkQuest;
         DataGridView stats;
         ListBox contents;
+        Button btnDetach, btnParts;
         Panel details;
         Label emptyHint;
         ToolStripStatusLabel status, warn;
+        ToolStripButton btnUndo, btnRedo;
+        ToolStripTextBox searchBox;
         bool loadingDetails;
+
+        public const string AppTitle = "Incursion Red River – Inventory Editor";
+        public bool RestartRequested;
+        public string Folder { get { return dir; } }
+        bool discardOnClose;
 
         public MainForm(string folder)
         {
+            Theme.DpiForm(this);
             Text = AppTitle;
-            Width = 1500; Height = 900;
+            Width = 1560; Height = 940;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             StartPosition = FormStartPosition.CenterScreen;
-            Font = new Font("Segoe UI", 9f);
+            Font = new Font("Segoe UI", 9.5f);
             KeyPreview = true;
             BuildUi();
             Theme.Apply(this);
             warn.ForeColor = Theme.Warn;
+            searchBox.BackColor = Theme.Surface; searchBox.ForeColor = Theme.Text;
             dir = folder;
+            undo = new UndoStack(UndoTargets, AfterRestore);
             Shown += delegate { LoadAll(); };
+            Activated += delegate { CheckDiskChanges(); };
             FormClosing += OnClosing;
             KeyDown += OnKey;
         }
@@ -56,42 +76,55 @@ namespace IrrEditor
         // ================================================================== UI construction
         void BuildUi()
         {
-            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(4), ImageScalingSize = new Size(16, 16), ShowItemToolTips = false };
+            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(6, 4, 6, 4), ShowItemToolTips = false };
             var darkTip = Theme.MakeTip();
             // native ToolStrip tooltips can't be themed – show our own dark one
-            Action<ToolStripItem, string> tipFor = (item, text) =>
+            Action<ToolStripItem, Func<string>> tipFor = (item, text) =>
             {
-                item.MouseEnter += delegate { if (!(item is ToolStripDropDownItem && ((ToolStripDropDownItem)item).DropDown.Visible)) { darkTip.Tag = text; darkTip.Show(text, ts, item.Bounds.X, item.Bounds.Bottom + 6, 4000); } };
+                item.MouseEnter += delegate
+                {
+                    if (item is ToolStripDropDownItem && ((ToolStripDropDownItem)item).DropDown.Visible) return;
+                    var t = text(); darkTip.Tag = t; darkTip.Show(t, ts, item.Bounds.X, item.Bounds.Bottom + Theme.S(6), 4000);
+                };
                 item.MouseLeave += delegate { darkTip.Hide(ts); };
                 item.MouseDown += delegate { darkTip.Hide(ts); };
             };
-            Action<string, string, EventHandler> add = (t, tip, h) => { var b = new ToolStripButton(t); tipFor(b, tip); b.Click += h; ts.Items.Add(b); };
+            Func<string, string, EventHandler, ToolStripButton> add = (t, tip, h) => { var b = new ToolStripButton(t); tipFor(b, () => tip); b.Click += h; ts.Items.Add(b); return b; };
             add(L.T("📂 Složka…", "📂 Folder…"), L.T("Vybrat složku SaveGames", "Choose the SaveGames folder"), delegate { PickFolder(); });
             add(L.T("⟳ Znovu načíst", "⟳ Reload"), L.T("Zahodit neuložené změny a načíst znovu", "Discard unsaved changes and reload"), delegate { if (ConfirmDiscard()) LoadAll(); });
-            add(L.T("💾 Uložit", "💾 Save"), L.T("Uložit změny (předtím se udělá záloha)", "Save changes (a backup is made first)"), delegate { SaveAll(); });
+            add(L.T("💾 Uložit", "💾 Save"), L.T("Uložit změny (Ctrl+S, předtím se udělá záloha)", "Save changes (Ctrl+S, a backup is made first)"), delegate { SaveAll(); });
             ts.Items.Add(new ToolStripSeparator());
-            add(L.T("＋ Přidat předmět…", "＋ Add item…"), L.T("Přidat předmět z katalogu do otevřeného kontejneru (Ins)", "Add an item from the catalog to the open container (Ins)"), delegate { AddItemDialog(); });
+            btnUndo = new ToolStripButton(L.T("↶ Zpět", "↶ Undo")) { Enabled = false };
+            btnUndo.Click += delegate { DoUndo(); };
+            tipFor(btnUndo, () => L.T("Vrátit: ", "Undo: ") + (undo.UndoLabel ?? "—") + " (Ctrl+Z)");
+            btnRedo = new ToolStripButton(L.T("↷ Znovu", "↷ Redo")) { Enabled = false };
+            btnRedo.Click += delegate { DoRedo(); };
+            tipFor(btnRedo, () => L.T("Znovu: ", "Redo: ") + (undo.RedoLabel ?? "—") + " (Ctrl+Y)");
+            ts.Items.Add(btnUndo); ts.Items.Add(btnRedo);
+            ts.Items.Add(new ToolStripSeparator());
+            add(L.T("＋ Přidat…", "＋ Add…"), L.T("Přidat předmět z katalogu do otevřeného kontejneru (Ins)", "Add an item from the catalog to the open container (Ins)"), delegate { AddItemDialog(); });
             add(L.T("⧉ Duplikovat", "⧉ Duplicate"), L.T("Duplikovat vybraný předmět i s obsahem (Ctrl+D)", "Duplicate the selected item with its contents (Ctrl+D)"), delegate { Duplicate(); });
-            add(L.T("✕ Smazat", "✕ Delete"), L.T("Smazat vybraný předmět i s obsahem (Del)", "Delete the selected item with its contents (Del)"), delegate { DeleteSel(); });
+            add(L.T("✕ Smazat", "✕ Delete"), L.T("Smazat vybrané předměty i s obsahem (Del)", "Delete the selected items with their contents (Del)"), delegate { DeleteSel(); });
             add(L.T("↻ Otočit", "↻ Rotate"), L.T("Otočit vybraný předmět (R)", "Rotate the selected item (R)"), delegate { RotateSel(); });
             ts.Items.Add(new ToolStripSeparator());
-            var smart = new ToolStripDropDownButton(L.T("✨ Chytré nástroje", "✨ Smart tools"));
+            var smart = new ToolStripDropDownButton(L.T("✨ Nástroje", "✨ Tools"));
             Action<string, EventHandler> sm = (t, h) => { var mi = new ToolStripMenuItem(t); mi.Click += h; smart.DropDownItems.Add(mi); };
-            sm(L.T("Opravit vše (výdrž na hodnotu nového kusu)", "Repair all (durability of a brand-new item)"), delegate { Bulk(L.T("Opraveno", "Repaired"), s => Tools.RepairAll(s)); });
-            sm(L.T("Doplnit všechny stacky na maximum", "Fill all stacks to maximum"), delegate { Bulk(L.T("Doplněno stacků", "Stacks filled"), s => Tools.FillStacks(s)); });
-            sm(L.T("Naplnit zásobníky (podle kapacity v názvu)", "Fill magazines (capacity from the name)"), delegate { Bulk(L.T("Naplněno zásobníků", "Magazines filled"), s => Tools.FillMagazines(s)); });
+            sm(L.T("Opravit vše (výdrž na hodnotu nového kusu)", "Repair all (durability of a brand-new item)"), delegate { Bulk(L.T("Opravit vše", "Repair all"), L.T("Opraveno", "Repaired"), s => Tools.RepairAll(s)); });
+            sm(L.T("Doplnit všechny stacky na maximum", "Fill all stacks to maximum"), delegate { Bulk(L.T("Doplnit stacky", "Fill stacks"), L.T("Doplněno stacků", "Stacks filled"), s => Tools.FillStacks(s)); });
+            sm(L.T("Naplnit zásobníky (podle kapacity v názvu)", "Fill magazines (capacity from the name)"), delegate { Bulk(L.T("Naplnit zásobníky", "Fill magazines"), L.T("Naplněno zásobníků", "Magazines filled"), s => Tools.FillMagazines(s)); });
             smart.DropDownItems.Add(new ToolStripSeparator());
             sm(L.T("Sloučit stacky v otevřeném kontejneru", "Merge stacks in the open container"), delegate { MergeCur(); });
             sm(L.T("Seřadit otevřený kontejner (podle kategorie a velikosti)", "Sort the open container (by category and size)"), delegate { SortCur(); });
             smart.DropDownItems.Add(new ToolStripSeparator());
-            sm(L.T("Odemknout zamčené strany skladu (experimentální)", "Unlock locked stash pages (experimental)"), delegate { UnlockPages(); });
+            sm(L.T("Odemknout zamčená políčka skladu (experimentální)", "Unlock locked stash cells (experimental)"), delegate { UnlockPages(); });
             sm(L.T("Zkontrolovat konzistenci (překryvy, mimo mřížku)", "Check consistency (overlaps, out of grid)"), delegate { ShowValidation(true); });
             ts.Items.Add(smart);
             ts.Items.Add(new ToolStripSeparator());
             add(L.T("🏠 Báze && reputace", "🏠 Base && reputation"), L.T("Úrovně zařízení v úkrytu, suroviny, level postavy a loajalita frakcí", "Hideout facility levels, resources, player level and faction loyalty"), delegate { OpenBase(); });
-            ts.Items.Add(new ToolStripSeparator());
-            add(L.T("🗂 Zálohy", "🗂 Backups"), L.T("Otevřít složku se zálohami", "Open the backups folder"), delegate { var b = BackupRoot(); Directory.CreateDirectory(b); Process.Start("explorer.exe", "\"" + b + "\""); });
-            // language switch on the right
+            add(L.T("🔧 Presety zbraní", "🔧 Weapon presets"), L.T("Presety z Gunsmithu – prohlížení, přejmenování, duplikace, mazání", "Gunsmith presets – browse, rename, duplicate, delete"), delegate { OpenGunsmith(); });
+            add(L.T("🗂 Zálohy", "🗂 Backups"), L.T("Seznam záloh a obnovení savů", "List backups and restore saves"), delegate { OpenBackups(); });
+
+            // right side: language, about, search
             var langBtn = new ToolStripDropDownButton(L.En ? "🌐 English" : "🌐 Čeština") { Alignment = ToolStripItemAlignment.Right };
             var miCz = new ToolStripMenuItem("Čeština") { Checked = !L.En };
             var miEn = new ToolStripMenuItem("English") { Checked = L.En };
@@ -100,84 +133,108 @@ namespace IrrEditor
             langBtn.DropDownItems.Add(miCz); langBtn.DropDownItems.Add(miEn);
             ts.Items.Add(langBtn);
             var about = new ToolStripButton(L.T("ⓘ O aplikaci", "ⓘ About")) { Alignment = ToolStripItemAlignment.Right };
-            about.Click += delegate { ShowAbout(); };
+            about.Click += delegate { using (var f = new AboutForm()) f.ShowDialog(this); };
             ts.Items.Add(about);
+            searchBox = new ToolStripTextBox { Alignment = ToolStripItemAlignment.Right, BorderStyle = BorderStyle.FixedSingle, AutoSize = false, Width = Theme.S(190) };
+            searchBox.TextChanged += delegate { ApplySearch(); };
+            searchBox.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter) { JumpToMatch(); e.Handled = e.SuppressKeyPress = true; }
+                else if (e.KeyCode == Keys.Escape) { searchBox.Text = ""; grid.Focus(); e.Handled = e.SuppressKeyPress = true; }
+            };
+            tipFor(searchBox, () => L.T("Hledat předmět (Ctrl+F). Enter = další výsledek, Esc = zrušit.", "Find an item (Ctrl+F). Enter = next match, Esc = clear."));
+            ts.Items.Add(searchBox);
+            ts.Items.Add(new ToolStripLabel("🔍") { Alignment = ToolStripItemAlignment.Right });
 
-            var ss = new StatusStrip();
-            status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-            warn = new ToolStripStatusLabel { ForeColor = Color.DarkRed };
+            var ss = new StatusStrip { SizingGrip = false };
+            status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Theme.Text };
+            warn = new ToolStripStatusLabel();
             ss.Items.Add(status); ss.Items.Add(warn);
 
-            tree = new TreeView { Dock = DockStyle.Fill, HideSelection = false, FullRowSelect = true, ShowLines = true, Font = new Font("Segoe UI", 9.5f) };
+            tree = new TreeView { Dock = DockStyle.Fill, HideSelection = false, FullRowSelect = true, ShowLines = true, Font = new Font("Segoe UI", 10f), ItemHeight = Theme.S(26) };
             tree.AfterSelect += OnTreeSelect;
 
             grid = new GridPanel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true };
             grid.Owner = this;
             Theme.DarkNative(grid);
-            gridTitle = new Label { Dock = DockStyle.Fill, ForeColor = Theme.Text, Font = new Font("Segoe UI Semibold", 11f), TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
-            btnBack = new Button { Text = L.T("← Zpět", "← Back"), Dock = DockStyle.Left, Width = 84 };
+            gridTitle = new Label { Dock = DockStyle.Fill, ForeColor = Theme.Text, Font = new Font("Segoe UI Semibold", 12f), TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
+            gridStats = new Label { Dock = DockStyle.Right, Width = 330, ForeColor = Theme.TextDim, TextAlign = ContentAlignment.MiddleRight, AutoEllipsis = true };
+            btnBack = new Button { Text = L.T("← Zpět", "← Back"), Dock = DockStyle.Left, Width = 90 };
             btnBack.Click += delegate { GoBack(); };
-            var gridHead = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.Panel, Padding = new Padding(6) };
-            gridHead.Controls.Add(gridTitle); gridHead.Controls.Add(btnBack);
-            var hint = new Label { Dock = DockStyle.Bottom, Height = 24, ForeColor = Theme.TextDim, BackColor = Theme.Panel, Padding = new Padding(8, 4, 0, 0), AutoEllipsis = true,
-                Text = L.T("Táhni myší = přesun · R = otočit · Del = smazat · Ctrl+D = duplikovat · Ins = přidat · dvojklik = otevřít batoh/vestu/zbraň",
-                           "Drag = move · R = rotate · Del = delete · Ctrl+D = duplicate · Ins = add · double-click = open backpack/rig/weapon") };
+            var gridHead = new Panel { Dock = DockStyle.Top, Height = 46, BackColor = Theme.Panel, Padding = new Padding(8, 7, 12, 7) };
+            var zoomOut = new Button { Text = "−", Dock = DockStyle.Right, Width = 40 };
+            var zoomIn = new Button { Text = "+", Dock = DockStyle.Right, Width = 40 };
+            var zoomLbl = new Label { Dock = DockStyle.Right, Width = 64, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Theme.TextDim, Text = "100 %" };
+            zoomOut.Click += delegate { grid.Zoom -= 0.1f; };
+            zoomIn.Click += delegate { grid.Zoom += 0.1f; };
+            grid.ZoomChanged += delegate { zoomLbl.Text = (int)Math.Round(grid.Zoom * 100) + " %"; };
+            gridHead.Controls.Add(gridTitle); gridHead.Controls.Add(gridStats); gridHead.Controls.Add(zoomOut); gridHead.Controls.Add(zoomLbl); gridHead.Controls.Add(zoomIn); gridHead.Controls.Add(btnBack);
+            var hint = new Label { Dock = DockStyle.Bottom, Height = 28, ForeColor = Theme.TextDim, BackColor = Theme.Panel, Padding = new Padding(10, 6, 0, 0), AutoEllipsis = true,
+                Text = L.T("Táhni = přesun (i do jiného kontejneru) · Ctrl+klik / tažení v prázdnu = výběr více · pravé tlačítko = menu · R = otočit · Ctrl+Z = zpět",
+                           "Drag = move (also into another container) · Ctrl+click / drag on empty space = multi-select · right-click = menu · R = rotate · Ctrl+Z = undo") };
             var center = new Panel { Dock = DockStyle.Fill };
             center.Controls.Add(grid); center.Controls.Add(hint); center.Controls.Add(gridHead);
 
             details = BuildDetails();
 
-            var splitR = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel2 };
+            var splitR = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel2, SplitterWidth = 6 };
             splitR.Panel1.Controls.Add(center);
             emptyHint = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Theme.TextDim,
                 Text = L.T("Klikni na předmět v mřížce nebo ve stromu\npro zobrazení a úpravu detailů.", "Click an item in the grid or the tree\nto view and edit its details.") };
             splitR.Panel2.Controls.Add(details);
             splitR.Panel2.Controls.Add(emptyHint);
-            var splitL = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
+            var splitL = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1, SplitterWidth = 6 };
             splitL.Panel1.Controls.Add(tree);
             splitL.Panel2.Controls.Add(splitR);
 
             Controls.Add(splitL);
             Controls.Add(ts);
             Controls.Add(ss);
-            Load += delegate { splitL.SplitterDistance = 300; splitR.SplitterDistance = Math.Max(200, splitR.Width - 380); };
+            Load += delegate { splitL.SplitterDistance = Theme.S(320); splitR.SplitterDistance = Math.Max(Theme.S(200), splitR.Width - Theme.S(400)); };
         }
 
         Panel BuildDetails()
         {
-            var p = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8), AutoScroll = true };
+            var p = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10), AutoScroll = true };
             var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2 };
-            t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
             t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            lblName = new Label { AutoSize = true, Font = new Font("Segoe UI Semibold", 12f), MaximumSize = new Size(340, 0) };
-            lblInfo = new Label { AutoSize = true, ForeColor = Theme.TextDim, MaximumSize = new Size(340, 0), Margin = new Padding(3, 2, 3, 8) };
+            lblName = new Label { AutoSize = true, Font = new Font("Segoe UI Semibold", 13f), MaximumSize = new Size(360, 0) };
+            lblInfo = new Label { AutoSize = true, ForeColor = Theme.TextDim, MaximumSize = new Size(360, 0), Margin = new Padding(3, 2, 3, 8) };
             txtDef = new TextBox { ReadOnly = true, Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle };
             numCount = new NumBox { Maximum = int.MaxValue, Minimum = 0, Dock = DockStyle.Fill, ThousandsSeparator = true };
             numMax = new NumBox { Maximum = int.MaxValue, Minimum = 1, Dock = DockStyle.Fill, ThousandsSeparator = true };
             chkQuest = new CheckBox { Text = L.T("Questový předmět", "Quest item"), AutoSize = true };
-            numCount.ValueChanged += delegate { if (!loadingDetails && selItem != null) { selItem.Count = (int)numCount.Value; Changed(selItem); } };
-            numMax.ValueChanged += delegate { if (!loadingDetails && selItem != null) { selItem.MaxStack = (int)numMax.Value; Changed(selItem); } };
-            chkQuest.CheckedChanged += delegate { if (!loadingDetails && selItem != null) { selItem.Quest = chkQuest.Checked; Changed(selItem); } };
+            numCount.ValueChanged += delegate { if (!loadingDetails && selItem != null) { Checkpoint(L.T("Změna počtu", "Change count"), "count:" + selItem.UidKey); selItem.Count = (int)numCount.Value; Changed(selItem); } };
+            numMax.ValueChanged += delegate { if (!loadingDetails && selItem != null) { Checkpoint(L.T("Změna max stacku", "Change max stack"), "max:" + selItem.UidKey); selItem.MaxStack = (int)numMax.Value; Changed(selItem); } };
+            chkQuest.CheckedChanged += delegate { if (!loadingDetails && selItem != null) { Checkpoint(L.T("Questový příznak", "Quest flag")); selItem.Quest = chkQuest.Checked; Changed(selItem); } };
 
-            var btnFill = new Button { Text = "Max", Width = 50 };
+            var btnFill = new Button { Text = "Max", Width = 56 };
             btnFill.Click += delegate { if (selItem != null) numCount.Value = Math.Max(selItem.MaxStack, 1); };
             var btnRepair = new Button { Text = L.T("🔧 Opravit", "🔧 Repair"), AutoSize = true };
-            btnRepair.Click += delegate { if (selItem != null) { if (Tools.Repair(selItem)) Changed(selItem); ShowDetails(selItem); } };
+            btnRepair.Click += delegate { RepairSel(); };
             var countRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
-            numCount.Width = 140; countRow.Controls.Add(numCount); countRow.Controls.Add(btnFill);
+            numCount.Width = 150; countRow.Controls.Add(numCount); countRow.Controls.Add(btnFill);
 
             stats = new DataGridView
             {
-                Dock = DockStyle.Top, Height = 260, AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false,
+                Dock = DockStyle.Top, Height = 270, AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false, AllowUserToResizeRows = false,
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, SelectionMode = DataGridViewSelectionMode.CellSelect,
-                BackgroundColor = SystemColors.Window, BorderStyle = BorderStyle.FixedSingle
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing, ColumnHeadersHeight = Theme.S(30)
             };
+            stats.RowTemplate.Height = Theme.S(26);
             stats.Columns.Add("stat", L.T("Statistika", "Stat")); stats.Columns.Add("val", L.T("Hodnota", "Value")); stats.Columns.Add("type", L.T("Typ", "Type"));
             stats.Columns[0].ReadOnly = true; stats.Columns[2].ReadOnly = true; stats.Columns[2].FillWeight = 50;
             stats.CellValueChanged += OnStatEdited;
 
-            contents = new ListBox { Dock = DockStyle.Top, Height = 160, IntegralHeight = false };
+            contents = new ListBox { Dock = DockStyle.Top, Height = 170, IntegralHeight = false };
             contents.DoubleClick += delegate { var it = contents.SelectedItem as ContentEntry; if (it != null) SelectItem(it.Item, true); };
+            var partBtns = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
+            btnParts = new Button { Text = L.T("🔩 Díly zbraně…", "🔩 Weapon parts…"), AutoSize = true };
+            btnParts.Click += delegate { OpenParts(); };
+            btnDetach = new Button { Text = L.T("⤒ Sundat vybraný díl do skladu", "⤒ Detach selected part to stash"), AutoSize = true };
+            btnDetach.Click += delegate { DetachPart(); };
+            partBtns.Controls.Add(btnParts); partBtns.Controls.Add(btnDetach);
 
             Func<string, Label> Lbl = s => new Label { Text = s, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 0, 0) };
             t.Controls.Add(lblName, 0, 0); t.SetColumnSpan(lblName, 2);
@@ -188,9 +245,9 @@ namespace IrrEditor
             t.Controls.Add(chkQuest, 1, 5);
             t.Controls.Add(btnRepair, 1, 6);
 
-            var lStats = new Label { Text = L.T("Statistiky (hodnoty jdou editovat)", "Stats (values are editable)"), Dock = DockStyle.Top, Height = 24, TextAlign = ContentAlignment.BottomLeft, Font = new Font("Segoe UI Semibold", 9f) };
-            var lCont = new Label { Text = L.T("Obsah / nasazené díly (dvojklik = vybrat)", "Contents / attached parts (double-click = select)"), Dock = DockStyle.Top, Height = 24, TextAlign = ContentAlignment.BottomLeft, Font = new Font("Segoe UI Semibold", 9f) };
-            p.Controls.Add(contents); p.Controls.Add(lCont); p.Controls.Add(stats); p.Controls.Add(lStats); p.Controls.Add(t);
+            Func<string, Label> Head = s => new Label { Text = s, Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.BottomLeft, Font = new Font("Segoe UI Semibold", 9.5f), ForeColor = Theme.Accent };
+            p.Controls.Add(partBtns); p.Controls.Add(contents); p.Controls.Add(Head(L.T("Obsah / nasazené díly (dvojklik = vybrat)", "Contents / attached parts (double-click = select)")));
+            p.Controls.Add(stats); p.Controls.Add(Head(L.T("Statistiky (hodnoty jdou editovat)", "Stats (values are editable)"))); p.Controls.Add(t);
             p.Visible = false;
             return p;
         }
@@ -230,13 +287,19 @@ namespace IrrEditor
                 vendor = File.Exists(vp) ? InvSave.Load(vp, "Vendor") : null;
                 try { baseData = BaseData.Load(dir); }
                 catch (Exception bex) { baseData = null; status.Text = L.T("Báze se nenačetla: ", "Base data failed to load: ") + bex.Message; }
+                try { gunsmith = SaveDoc.TryLoad(Path.Combine(dir, "GunsmithSaveGame.sav")); } catch { gunsmith = null; }
                 Catalog.Build(new[] { vendor, stash, inv }.Where(x => x != null));
                 history.Clear();
+                undo.Clear(); UpdateUndoButtons();
+                RefreshStamps();
                 RebuildTree();
-                var main = stash != null ? stash.Containers.FirstOrDefault(c => c.IsTopLevel && c.HasGrid) : null;
-                if (main != null) ShowContainer(main, false);
+                selItem = null;
+                if (stash != null) SetView(ViewKind.StashAll, null, false);
+                else if (inv != null) SetView(ViewKind.Loadout, null, false);
+                ShowDetails(null);
                 status.Text = L.T("Načteno: ", "Loaded: ") + dir + "   ·   " + L.T("katalog " + Catalog.Entries.Count + " předmětů", "catalog of " + Catalog.Entries.Count + " items");
                 ShowValidation(false);
+                UpdateTitle();
             }
             catch (Exception ex)
             {
@@ -245,7 +308,7 @@ namespace IrrEditor
             finally { Cursor = Cursors.Default; }
         }
 
-        static bool GameRunning()
+        public static bool GameRunning()
         {
             return Process.GetProcesses().Any(p =>
             {
@@ -256,10 +319,60 @@ namespace IrrEditor
 
         string BackupRoot() { return Path.Combine(dir, "_IRR_Editor_Backups"); }
 
+        // ---- change detection: did the game write the saves while the editor was open?
+        void RefreshStamps()
+        {
+            stamps.Clear();
+            try { foreach (var f in Directory.GetFiles(dir, "*.sav")) stamps[f] = File.GetLastWriteTimeUtc(f); } catch { }
+        }
+
+        List<string> ChangedOnDisk()
+        {
+            var res = new List<string>();
+            try
+            {
+                foreach (var f in Directory.GetFiles(dir, "*.sav"))
+                {
+                    DateTime t;
+                    if (!stamps.TryGetValue(f, out t) || File.GetLastWriteTimeUtc(f) != t) res.Add(Path.GetFileName(f));
+                }
+            }
+            catch { }
+            return res;
+        }
+
+        bool checkingDisk;
+        void CheckDiskChanges()
+        {
+            if (dir == null || stamps.Count == 0 || checkingDisk) return;
+            var ch = ChangedOnDisk();
+            if (ch.Count == 0) return;
+            checkingDisk = true;
+            try
+            {
+                if (!AnyDirty())
+                {
+                    LoadAll();
+                    status.Text = L.T("Savy se mezitím změnily na disku (hra?) – načteno znovu.", "The saves changed on disk (the game?) – reloaded.");
+                }
+                else warn.Text = L.T("⚠ Savy se změnily na disku – při uložení se zeptám", "⚠ Saves changed on disk – you'll be asked on save");
+            }
+            finally { checkingDisk = false; }
+        }
+
+        IEnumerable<SaveDoc> Docs
+        {
+            get
+            {
+                if (baseData != null) foreach (var d in baseData.Docs) yield return d;
+                if (gunsmith != null) yield return gunsmith;
+            }
+        }
+
         void SaveAll()
         {
             var dirty = new[] { stash, inv }.Where(s => s != null && s.Dirty).ToList();
-            var dirtyDocs = baseData == null ? new List<SaveDoc>() : baseData.Docs.Where(d => d.Dirty).ToList();
+            var dirtyDocs = Docs.Where(d => d.Dirty).ToList();
             if (dirty.Count == 0 && dirtyDocs.Count == 0) { status.Text = L.T("Žádné změny k uložení.", "Nothing to save."); return; }
             if (GameRunning())
             {
@@ -267,6 +380,17 @@ namespace IrrEditor
                                        "The game is running. Only save while the game is closed – otherwise the game overwrites the files on exit (or the state breaks)."),
                              L.T("Hra běží", "Game is running"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
+            }
+            var changed = ChangedOnDisk();
+            if (changed.Count > 0)
+            {
+                var r = DarkMsg.Show(this, L.T("Tyto savy se od načtení změnily na disku (nejspíš je uložila hra):\n" + string.Join(", ", changed) +
+                                               "\n\nAno = načíst je znovu (tvoje neuložené změny se zahodí)\nNe = přesto uložit (přepíše novější stav ze hry)",
+                                               "These saves changed on disk since loading (probably written by the game):\n" + string.Join(", ", changed) +
+                                               "\n\nYes = reload them (your unsaved changes are discarded)\nNo = save anyway (overwrites the newer state from the game)"),
+                                     L.T("Savy se změnily", "Saves changed"), MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+                if (r == DialogResult.Yes) { LoadAll(); return; }
+                if (r != DialogResult.No) return;
             }
             var problems = dirty.SelectMany(s => s.Validate()).ToList();
             if (problems.Count > 0 && DarkMsg.Show(this, L.T("Nalezené problémy:\n\n", "Problems found:\n\n") + string.Join("\n", problems.Take(15)) + L.T("\n\nPřesto uložit?", "\n\nSave anyway?"),
@@ -285,8 +409,11 @@ namespace IrrEditor
                     File.Copy(tmp, w.Key, true);
                     File.Delete(tmp);
                 }
+                RefreshStamps();
+                warn.Text = "";
                 status.Text = L.T("Uloženo (", "Saved (") + string.Join(", ", writes.Select(w => Path.GetFileName(w.Key))) + L.T("). Záloha: ", "). Backup: ") + bdir;
                 UpdateTitle();
+                ShowValidation(false);
             }
             catch (Exception ex)
             {
@@ -296,43 +423,7 @@ namespace IrrEditor
 
         bool AnyDirty()
         {
-            return new[] { stash, inv }.Any(s => s != null && s.Dirty) || (baseData != null && baseData.Docs.Any(d => d.Dirty));
-        }
-
-        void OpenBase()
-        {
-            if (baseData == null) return;
-            using (var f = new BaseForm(baseData))
-                if (f.ShowDialog(this) == DialogResult.OK && f.Changed) { status.Text = L.T("Báze / reputace upravena – nezapomeň uložit.", "Base / reputation changed – don't forget to save."); UpdateTitle(); }
-        }
-
-        /// <summary>Restart the window in the other language (the UI is built once in the constructor).</summary>
-        public bool RestartRequested;
-        public string Folder { get { return dir; } }
-        void SwitchLanguage(bool en)
-        {
-            if (en == L.En) return;
-            if (AnyDirty() && DarkMsg.Show(this, L.T("Přepnutí jazyka znovu načte savy a neuložené změny se zahodí. Pokračovat?", "Switching language reloads the saves and discards unsaved changes. Continue?"),
-                                           L.T("Jazyk", "Language"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            L.Save(en);
-            RestartRequested = true;
-            discardOnClose = true;
-            Close();
-        }
-        bool discardOnClose;
-
-        void ShowAbout()
-        {
-            var v = typeof(MainForm).Assembly.GetName().Version;
-            DarkMsg.Show(this,
-                "IRR Inventory Editor  v" + v.Major + "." + v.Minor + "." + v.Build + "\n\n" +
-                L.T("Neoficiální editor savů pro Incursion Red River – sklad, výbava, báze a reputace.\n" +
-                    "Před každým uložením se savy zálohují. Používej jen se zavřenou hrou.\n\n" +
-                    "Není spojeno s vývojáři hry (Games Farm).",
-                    "Unofficial save editor for Incursion Red River – stash, loadout, base and reputation.\n" +
-                    "Saves are backed up before every write. Only use it while the game is closed.\n\n" +
-                    "Not affiliated with the game's developers (Games Farm)."),
-                L.T("O aplikaci", "About"));
+            return new[] { stash, inv }.Any(s => s != null && s.Dirty) || Docs.Any(d => d.Dirty);
         }
 
         bool ConfirmDiscard()
@@ -349,20 +440,68 @@ namespace IrrEditor
             else if (r == DialogResult.Yes) { SaveAll(); if (AnyDirty()) e.Cancel = true; }
         }
 
-        public const string AppTitle = "Incursion Red River – Inventory Editor";
         void UpdateTitle()
         {
-            bool d = AnyDirty();
-            Text = AppTitle + (d ? L.T("  •  neuloženo", "  •  unsaved") : "");
+            Text = AppTitle + (AnyDirty() ? L.T("  •  neuloženo", "  •  unsaved") : "");
         }
 
         void ShowValidation(bool popup)
         {
             var issues = new[] { stash, inv }.Where(s => s != null).SelectMany(s => s.Validate()).ToList();
-            warn.Text = issues.Count == 0 ? "" : L.T("⚠ " + issues.Count + " problém(ů) – Chytré nástroje → Zkontrolovat", "⚠ " + issues.Count + " issue(s) – Smart tools → Check");
+            if (!warn.Text.StartsWith("⚠ " + L.T("Savy", "Saves")))
+                warn.Text = issues.Count == 0 ? "" : L.T("⚠ " + issues.Count + " problém(ů) – Nástroje → Zkontrolovat", "⚠ " + issues.Count + " issue(s) – Tools → Check");
             if (popup)
                 DarkMsg.Show(this, issues.Count == 0 ? L.T("Vše v pořádku – žádné překryvy ani předměty mimo mřížku.", "All good – no overlaps and nothing outside the grid.") : string.Join("\n", issues.Take(30)),
                              L.T("Kontrola konzistence", "Consistency check"));
+        }
+
+        // ================================================================== undo / redo
+        List<IUndoTarget> UndoTargets()
+        {
+            var l = new List<IUndoTarget>();
+            if (stash != null) l.Add(stash);
+            if (inv != null) l.Add(inv);
+            foreach (var d in Docs) l.Add(d);
+            return l;
+        }
+
+        string pendingSelect;
+        void AfterRestore()
+        {
+            if (stash != null) stash.Rebuild();
+            if (inv != null) inv.Rebuild();
+            if (baseData != null) baseData = BaseData.Build(baseData.Hideout, baseData.Resource, baseData.Mission);
+            StructureChanged(pendingSelect);
+        }
+
+        void Checkpoint(string label, string key = null)
+        {
+            undo.Checkpoint(label, key);
+            UpdateUndoButtons();
+        }
+
+        void UpdateUndoButtons()
+        {
+            btnUndo.Enabled = undo.CanUndo;
+            btnRedo.Enabled = undo.CanRedo;
+        }
+
+        void DoUndo()
+        {
+            if (!undo.CanUndo) return;
+            pendingSelect = selItem == null ? null : selItem.UidKey;
+            var l = undo.Undo();
+            status.Text = L.T("Vráceno: ", "Undone: ") + l;
+            UpdateUndoButtons(); UpdateTitle();
+        }
+
+        void DoRedo()
+        {
+            if (!undo.CanRedo) return;
+            pendingSelect = selItem == null ? null : selItem.UidKey;
+            var l = undo.Redo();
+            status.Text = L.T("Znovu provedeno: ", "Redone: ") + l;
+            UpdateUndoButtons(); UpdateTitle();
         }
 
         // ================================================================== tree
@@ -373,7 +512,7 @@ namespace IrrEditor
             foreach (var s in new[] { stash, inv })
             {
                 if (s == null) continue;
-                var root = tree.Nodes.Add(s.Kind == "Stash" ? L.T("📦 Sklad", "📦 Stash") : L.T("🎒 Výbava postavy", "🎒 Character loadout"));
+                var root = tree.Nodes.Add(s.Kind == "Stash" ? L.T("📦 Sklad (všechny strany)", "📦 Stash (all pages)") : L.T("🎒 Výbava postavy", "🎒 Character loadout"));
                 root.Tag = s;
                 foreach (var mc in s.Containers.Where(c => c.Label != null && s.TopUids.Contains(c.UidKey)))
                 {
@@ -384,6 +523,7 @@ namespace IrrEditor
                 root.Expand();
             }
             tree.EndUpdate();
+            HighlightTree();
         }
 
         void AddItemNodes(InvSave s, TreeNode parent, MainContainer mc)
@@ -416,28 +556,19 @@ namespace IrrEditor
             var save = e.Node.Tag as InvSave;
             if (save != null)
             {
-                if (save.Kind == "Inventory") ShowLoadout(true);
-                else { var main = save.Containers.FirstOrDefault(c => c.IsTopLevel && c.HasGrid); if (main != null) ShowContainer(main, true); }
+                SetView(save.Kind == "Inventory" ? ViewKind.Loadout : ViewKind.StashAll, null, true);
                 SelectItem(null, false);
                 return;
             }
             var mc = e.Node.Tag as MainContainer;
             var it = e.Node.Tag as InvItem;
-            if (mc != null && mc.HasGrid && !(loadoutView && grid.Shows(mc))) { ShowContainer(mc, true); return; }
+            if (mc != null && mc.HasGrid) { SetView(ViewKind.Container, mc, true); return; }
             if (mc != null && mc.Items.Count > 0) it = mc.Items[0];
-            if (mc != null && mc.Items.Count == 0 && mc.Save.Kind == "Inventory") { ShowLoadout(true); SelectItem(null, false); return; }
-            if (it != null)
-            {
-                // character gear that isn't inside a grid (weapons, slots, attachments) → character overview
-                if (it.Container.Save.Kind == "Inventory" && GridAncestor(it) == null && !loadoutView) ShowLoadout(true);
-                SelectItem(it, false);
-            }
+            if (mc != null && mc.Items.Count == 0 && mc.Save.Kind == "Inventory") { SetView(ViewKind.Loadout, null, true); SelectItem(null, false); return; }
+            if (it != null) SelectItem(it, false);
         }
 
-        // ================================================================== navigation / selection
-        InvSave SaveOf(MainContainer mc) { return mc == null ? null : mc.Save; }
-        bool loadoutView; // character overview (all equipment slots + their grids) is shown
-
+        // ================================================================== views / navigation
         static MainContainer GridAncestor(InvItem it)
         {
             var probe = it == null ? null : it.Container;
@@ -445,66 +576,101 @@ namespace IrrEditor
             return probe != null && probe.HasGrid ? probe : null;
         }
 
-        void PushCurrentView()
+        MainContainer MainStash { get { return stash == null ? null : stash.Containers.FirstOrDefault(c => c.IsTopLevel && c.HasGrid); } }
+
+        void SetView(ViewKind kind, MainContainer mc, bool push)
         {
-            if (loadoutView) history.Push(null);          // null = character overview
-            else if (curMC != null) history.Push(curMC);
+            if (push && (kind != view || mc != viewMc) && (view != ViewKind.Container || viewMc != null))
+                history.Push(new ViewRef { Kind = view, Mc = viewMc });
+            view = kind; viewMc = mc;
+            var secs = new List<GridSection>();
+            string title;
+            if (kind == ViewKind.Container && mc != null)
+            {
+                secs.Add(new GridSection { Mc = mc });
+                title = mc.Title + "   ·   " + (mc.Save.Kind == "Stash" ? L.T("Sklad", "Stash") : L.T("Výbava", "Loadout"));
+                curMC = mc;
+            }
+            else if (kind == ViewKind.StashAll && stash != null)
+            {
+                foreach (var key in stash.TopUids)
+                {
+                    MainContainer m;
+                    if (stash.ByUid.TryGetValue(key, out m) && m.HasGrid) secs.Add(new GridSection { Mc = m, Title = m.Title });
+                }
+                title = L.T("Sklad   ·   všechny strany", "Stash   ·   all pages");
+                curMC = MainStash;
+            }
+            else
+            {
+                view = ViewKind.Loadout;
+                if (inv != null)
+                    foreach (var key in inv.TopUids)
+                    {
+                        MainContainer m;
+                        if (!inv.ByUid.TryGetValue(key, out m)) continue;
+                        if (m.HasGrid) { secs.Add(new GridSection { Mc = m, Title = m.Title }); continue; }
+                        secs.Add(new GridSection { Mc = m, Title = m.Title, SlotOnly = true });
+                        var it = m.Items.FirstOrDefault();
+                        var sub = it == null ? null : inv.ContainerOf(it);
+                        if (sub != null && sub.HasGrid) secs.Add(new GridSection { Mc = sub, Title = "↳ " + it.DisplayName + L.T(" – obsah", " – contents") });
+                    }
+                title = L.T("Výbava postavy   ·   přehled", "Loadout   ·   overview");
+                curMC = null;
+            }
+            gridTitle.Text = "  " + title;
+            btnBack.Enabled = history.Count > 0;
+            grid.NoWrap = kind == ViewKind.StashAll;
+            grid.Show(secs);
+            grid.Search = SearchQuery;
+            UpdateGridStats();
+        }
+
+        void UpdateGridStats()
+        {
+            int n = 0; float kg = 0;
+            foreach (var mc in grid.Containers.Distinct())
+                foreach (var it in mc.Items)
+                {
+                    n++;
+                    kg += it.Weight * Math.Max(1, it.CanStack ? it.Count : 1);
+                    foreach (var d in it.Container.Save.Descendants(it)) kg += d.Weight * Math.Max(1, d.CanStack ? d.Count : 1);
+                }
+            gridStats.Text = L.T(n + " předmětů  ·  " + kg.ToString("0.#") + " kg", n + " items  ·  " + kg.ToString("0.#") + " kg");
         }
 
         void GoBack()
         {
             if (history.Count == 0) return;
-            var m = history.Pop();
-            if (m == null) ShowLoadout(false); else ShowContainer(m, false);
+            var v = history.Pop();
+            SetView(v.Kind, v.Mc, false);
         }
 
-        public void ShowContainer(MainContainer mc, bool pushHistory)
+        public void ShowContainer(MainContainer mc, bool push) { SetView(ViewKind.Container, mc, push); }
+
+        bool VisibleInGrid(InvItem it)
         {
-            if (pushHistory && (loadoutView || curMC != mc)) PushCurrentView();
-            loadoutView = false;
-            curMC = mc;
-            gridTitle.Text = "  " + mc.Title + "   ·   " + (mc.Save.Kind == "Stash" ? L.T("Sklad", "Stash") : L.T("Výbava", "Loadout"));
-            btnBack.Enabled = history.Count > 0;
-            grid.Show(mc);
+            if (it == null) return true;
+            if (grid.Shows(it.Container)) return true;
+            var probe = GridAncestor(it);
+            if (probe == null) return view == ViewKind.Loadout && it.Container.Save == inv;
+            return grid.Shows(probe);
         }
 
-        /// <summary>Character overview: every equipment slot, plus the grids of rig / pouch / backpack.</summary>
-        public void ShowLoadout(bool pushHistory)
-        {
-            if (inv == null) return;
-            if (pushHistory && !loadoutView) PushCurrentView();
-            loadoutView = true;
-            curMC = null;
-            var secs = new List<GridSection>();
-            foreach (var key in inv.TopUids)
-            {
-                MainContainer mc;
-                if (!inv.ByUid.TryGetValue(key, out mc)) continue;
-                if (mc.HasGrid) { secs.Add(new GridSection { Mc = mc, Title = mc.Title }); continue; }
-                secs.Add(new GridSection { Mc = mc, Title = mc.Title, SlotOnly = true });
-                var it = mc.Items.FirstOrDefault();
-                var sub = it == null ? null : inv.ContainerOf(it);
-                if (sub != null && sub.HasGrid) secs.Add(new GridSection { Mc = sub, Title = "↳ " + it.DisplayName + L.T(" – obsah", " – contents") });
-            }
-            gridTitle.Text = L.T("  Výbava postavy   ·   přehled", "  Character loadout   ·   overview");
-            btnBack.Enabled = history.Count > 0;
-            grid.Show(secs);
-        }
-
+        /// <summary>Bring the item on screen (switching views if needed) and make it the selection.</summary>
         public void SelectItem(InvItem it, bool syncTree)
         {
             selItem = it;
-            // pick the grid to display: the item's own container if it's a grid, else walk up to the nearest grid
-            var probe = GridAncestor(it);
-            if (loadoutView)
+            if (it != null && !VisibleInGrid(it))
             {
-                // stay in the overview while the item is visible in it (or has no grid at all, e.g. weapon parts)
-                bool visible = it == null || grid.Shows(it.Container) || probe == null || grid.Shows(probe);
-                if (!visible) ShowContainer(probe, true);
-                else curMC = it != null && it.Container.HasGrid ? it.Container : null; // target for Add / Sort
+                var probe = GridAncestor(it);
+                if (probe == null) SetView(ViewKind.Loadout, null, true);
+                else if (probe.Save == stash && stash.TopUids.Contains(probe.UidKey)) SetView(ViewKind.StashAll, null, true);
+                else SetView(ViewKind.Container, probe, true);
             }
-            else if (probe != null && probe != curMC) ShowContainer(probe, true);
+            if (view != ViewKind.Container && it != null && it.Container.HasGrid) curMC = it.Container; // target for Add / Sort
             grid.Selected = it;
+            grid.Multi.Clear();
             grid.Invalidate();
             ShowDetails(it);
             if (it != null)
@@ -514,10 +680,37 @@ namespace IrrEditor
             }
         }
 
+        public void ToggleMulti(InvItem it)
+        {
+            if (selItem == null) { SelectItem(it, true); return; }
+            if (it == selItem) return;
+            if (!grid.Multi.Remove(it)) grid.Multi.Add(it);
+            grid.Invalidate();
+            ShowDetails(selItem);
+        }
+
+        public void SelectMany(List<InvItem> items)
+        {
+            if (items.Count == 0) { SelectItem(null, true); return; }
+            SelectItem(items[0], true);
+            foreach (var it in items.Skip(1)) grid.Multi.Add(it);
+            grid.Invalidate();
+            ShowDetails(selItem);
+        }
+
+        List<InvItem> Selection()
+        {
+            var l = new List<InvItem>();
+            if (selItem != null) l.Add(selItem);
+            l.AddRange(grid.Multi.Where(x => x != selItem));
+            return l;
+        }
+
         public void OpenItem(InvItem it)
         {
             var sub = it.Container.Save.ContainerOf(it);
-            if (sub != null && sub.HasGrid) ShowContainer(sub, true);
+            if (sub != null && sub.HasGrid) SetView(ViewKind.Container, sub, true);
+            else if (sub != null && sub.Elements.Count > 0 && Catalog.Sockets.Keys.Any(k => k.StartsWith(it.Def + "#"))) { SelectItem(it, true); OpenParts(); }
             else SelectItem(it, true);
         }
 
@@ -528,10 +721,11 @@ namespace IrrEditor
             emptyHint.Visible = it == null;
             if (it == null)
             {
-                lblName.Text = L.T("Nic nevybráno", "Nothing selected"); lblInfo.Text = ""; txtDef.Text = ""; stats.Rows.Clear(); contents.Items.Clear();
+                lblName.Text = ""; lblInfo.Text = ""; txtDef.Text = ""; stats.Rows.Clear(); contents.Items.Clear();
                 loadingDetails = false; return;
             }
-            lblName.Text = it.DisplayName;
+            int extra = grid.Multi.Count(x => x != it);
+            lblName.Text = it.DisplayName + (extra > 0 ? L.T("   (+" + extra + " dalších)", "   (+" + extra + " more)") : "");
             CatalogEntry ce; Catalog.Entries.TryGetValue(it.Def, out ce);
             var s = it.Container.Save;
             var desc = s.Descendants(it).ToList();
@@ -540,7 +734,8 @@ namespace IrrEditor
                 + "  ·  " + totalW.ToString("0.###") + " kg"
                 + (it.State.Length > 2 ? L.T("\nStav: ", "\nState: ") + it.State : "")
                 + (ce != null && ce.NewDurability != null ? L.T("\nVýdrž nového kusu: ", "\nDurability when new: ") + ce.NewDurability.Value.ToString("0.##") : "")
-                + (it.Count > it.MaxStack ? L.T("\n⚠ Počet je vyšší než Max stack", "\n⚠ Count is higher than Max stack") : "");
+                + (it.Count > it.MaxStack ? L.T("\n⚠ Počet je vyšší než Max stack", "\n⚠ Count is higher than Max stack") : "")
+                + (extra > 0 ? L.T("\nVybráno " + (extra + 1) + " předmětů – Smazat, Opravit a Přesunout platí pro všechny.", "\n" + (extra + 1) + " items selected – Delete, Repair and Move apply to all.") : "");
             txtDef.Text = it.Def;
             numCount.Value = Math.Max(0, it.Count);
             numMax.Value = Math.Max(1, it.MaxStack);
@@ -553,6 +748,9 @@ namespace IrrEditor
             }
             contents.Items.Clear();
             AddContents(s, it, 0);
+            var own = s.ContainerOf(it);
+            btnParts.Visible = own != null && !own.HasGrid && own.Elements.Count > 0;
+            btnDetach.Visible = contents.Items.Count > 0;
             loadingDetails = false;
         }
 
@@ -575,6 +773,7 @@ namespace IrrEditor
             float v;
             if (float.TryParse(txt, NumberStyles.Float, CultureInfo.CurrentCulture, out v) || float.TryParse(txt, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
             {
+                Checkpoint(L.T("Úprava statistiky ", "Edit stat ") + st.ShortTag);
                 st.Value = v;
                 Changed(selItem);
             }
@@ -595,57 +794,222 @@ namespace IrrEditor
             UpdateTitle();
         }
 
-        void StructureChanged(InvItem select)
+        InvItem FindItem(string uid)
+        {
+            if (uid == null) return null;
+            InvItem it;
+            if (stash != null && stash.ItemsByUid.TryGetValue(uid, out it)) return it;
+            if (inv != null && inv.ItemsByUid.TryGetValue(uid, out it)) return it;
+            return null;
+        }
+
+        void StructureChanged(InvItem select) { StructureChanged(select == null ? null : select.UidKey); }
+
+        /// <summary>Everything was rebuilt: re-resolve view/history by UID, refresh tree, grid and selection.</summary>
+        void StructureChanged(string selectUid)
         {
             foreach (var s in new[] { stash, inv }) if (s != null) s.Rebuild();
-            // re-resolve current container by uid (objects are rebuilt)
-            if (curMC != null)
+            Func<MainContainer, MainContainer> resolve = m =>
             {
-                MainContainer m;
-                curMC = curMC.Save.ByUid.TryGetValue(curMC.UidKey, out m) ? m : curMC.Save.Containers.FirstOrDefault(c => c.HasGrid);
-            }
-            // null entries (character overview) survive; containers are re-resolved, vanished ones dropped
-            var hist = new List<MainContainer>();
-            foreach (var h in history.Reverse())
-            {
-                MainContainer m;
-                if (h == null) hist.Add(null);
-                else if (h.Save.ByUid.TryGetValue(h.UidKey, out m)) hist.Add(m);
-            }
+                if (m == null) return null;
+                MainContainer r;
+                return m.Save.ByUid.TryGetValue(m.UidKey, out r) ? r : null;
+            };
+            var hist = history.Reverse().Select(h => new ViewRef { Kind = h.Kind, Mc = resolve(h.Mc) })
+                              .Where(h => h.Kind != ViewKind.Container || h.Mc != null).ToList();
             history.Clear(); foreach (var h in hist) history.Push(h);
+            var vm = resolve(viewMc);
+            if (view == ViewKind.Container && vm == null) { view = ViewKind.StashAll; }
+            var keepCur = resolve(curMC);
             RebuildTree();
-            if (loadoutView) ShowLoadout(false);
-            else if (curMC != null) ShowContainer(curMC, false);
-            if (select != null)
-            {
-                InvItem fresh;
-                select = select.Container.Save.ItemsByUid.TryGetValue(select.UidKey, out fresh) ? fresh : null;
-            }
-            SelectItem(select, true);
+            SetView(view, vm, false);
+            if (keepCur != null && view != ViewKind.Container) curMC = keepCur;
+            SelectItem(FindItem(selectUid), true);
             UpdateTitle();
             ShowValidation(false);
+            UpdateUndoButtons();
+        }
+
+        // ================================================================== search
+        string SearchQuery { get { return searchBox == null ? "" : searchBox.Text.Trim().ToLowerInvariant(); } }
+
+        IEnumerable<InvItem> AllItems()
+        {
+            foreach (var s in new[] { stash, inv })
+                if (s != null) foreach (var it in s.ItemsByUid.Values) yield return it;
+        }
+
+        bool searchStatus;   // status bar currently shows search results
+        void ApplySearch()
+        {
+            grid.Search = SearchQuery;
+            grid.Invalidate();
+            HighlightTree();
+            var q = SearchQuery;
+            if (q.Length == 0) { if (searchStatus) status.Text = ""; searchStatus = false; return; }
+            searchStatus = true;
+            int a = stash == null ? 0 : stash.ItemsByUid.Values.Count(i => GridPanel.Matches(i, q));
+            int b = inv == null ? 0 : inv.ItemsByUid.Values.Count(i => GridPanel.Matches(i, q));
+            status.Text = L.T("Nalezeno: " + (a + b) + "  (sklad " + a + ", výbava " + b + ")  ·  Enter = další", "Found: " + (a + b) + "  (stash " + a + ", loadout " + b + ")  ·  Enter = next");
+        }
+
+        void HighlightTree()
+        {
+            var q = SearchQuery;
+            Action<TreeNodeCollection> walk = null;
+            walk = nodes =>
+            {
+                foreach (TreeNode n in nodes)
+                {
+                    var it = n.Tag as InvItem;
+                    bool hit = it != null && GridPanel.Matches(it, q);
+                    n.BackColor = hit ? Theme.AccentBg : Color.Empty;
+                    if (hit && n.Parent != null) n.Parent.Expand();
+                    walk(n.Nodes);
+                }
+            };
+            tree.BeginUpdate(); walk(tree.Nodes); tree.EndUpdate();
+        }
+
+        void JumpToMatch()
+        {
+            var q = SearchQuery; if (q.Length == 0) return;
+            var list = AllItems().Where(i => GridPanel.Matches(i, q)).ToList();
+            if (list.Count == 0) return;
+            int idx = selItem == null ? -1 : list.IndexOf(selItem);
+            SelectItem(list[(idx + 1) % list.Count], true);
+            status.Text = L.T("Výsledek ", "Match ") + ((idx + 1) % list.Count + 1) + " / " + list.Count;
         }
 
         // ================================================================== actions
         void OnKey(object sender, KeyEventArgs e)
         {
-            if (ActiveControl is TextBox || ActiveControl is NumBox || stats.IsCurrentCellInEditMode || stats.Focused) return;
-            if (e.KeyCode == Keys.Delete) { DeleteSel(); e.Handled = true; }
+            if (e.Control && e.KeyCode == Keys.F) { searchBox.Focus(); searchBox.SelectAll(); e.Handled = true; return; }
+            if (searchBox.Focused) return;
+            if (e.Control && e.KeyCode == Keys.S) { SaveAll(); e.Handled = true; return; }
+            if (ActiveControl is TextBox || stats.IsCurrentCellInEditMode || stats.Focused) return;
+            if (e.Control && e.KeyCode == Keys.Z && !e.Shift) { DoUndo(); e.Handled = true; }
+            else if (e.Control && (e.KeyCode == Keys.Y || (e.KeyCode == Keys.Z && e.Shift))) { DoRedo(); e.Handled = true; }
+            else if (e.KeyCode == Keys.Delete) { DeleteSel(); e.Handled = true; }
             else if (e.KeyCode == Keys.R && !e.Control) { RotateSel(); e.Handled = true; }
             else if (e.KeyCode == Keys.D && e.Control) { Duplicate(); e.Handled = true; }
             else if (e.KeyCode == Keys.Insert) { AddItemDialog(); e.Handled = true; }
-            else if (e.KeyCode == Keys.S && e.Control) { SaveAll(); e.Handled = true; }
+            else if (e.KeyCode == Keys.Escape) { SelectItem(null, true); e.Handled = true; }
             else if (e.KeyCode == Keys.Back && history.Count > 0) { GoBack(); e.Handled = true; }
+        }
+
+        /// <summary>Right-click menu on a grid item.</summary>
+        public void ShowItemMenu(InvItem it, Point screen)
+        {
+            var sel = Selection();
+            var m = new ContextMenuStrip { Renderer = new Theme.DarkRenderer(), BackColor = Theme.Surface, ForeColor = Theme.Text, ShowImageMargin = false, Font = Font };
+            Action<string, EventHandler, bool> mi = (t, h, en) => { var x = new ToolStripMenuItem(t) { Enabled = en }; x.Click += h; m.Items.Add(x); };
+            string n = sel.Count > 1 ? " (" + sel.Count + ")" : "";
+            var move = new ToolStripMenuItem(L.T("⇄ Přesunout do", "⇄ Move to") + n);
+            foreach (var s in new[] { stash, inv })
+            {
+                if (s == null) continue;
+                foreach (var kv in s.GridContainers())
+                {
+                    var target = kv.Value;
+                    if (sel.Any(x => x.Container == target || s.IsInside(target, x))) continue;
+                    var x2 = new ToolStripMenuItem((s.Kind == "Stash" ? L.T("Sklad: ", "Stash: ") : L.T("Výbava: ", "Loadout: ")) + kv.Key);
+                    x2.Click += delegate { MoveSelectionTo(target); };
+                    move.DropDownItems.Add(x2);
+                }
+            }
+            if (move.DropDownItems.Count == 0) move.Enabled = false;
+            foreach (ToolStripItem d in move.DropDownItems) d.ForeColor = Theme.Text;
+            ((ToolStripDropDownMenu)move.DropDown).ShowImageMargin = false;
+            move.DropDown.BackColor = Theme.Surface;
+            m.Items.Add(move);
+            var sub = it.Container.Save.ContainerOf(it);
+            if (sub != null && sub.HasGrid) mi(L.T("▣ Otevřít", "▣ Open"), delegate { SetView(ViewKind.Container, sub, true); }, true);
+            if (sub != null && !sub.HasGrid && sub.Elements.Count > 0) mi(L.T("🔩 Díly zbraně…", "🔩 Weapon parts…"), delegate { OpenParts(); }, sel.Count == 1);
+            mi(L.T("↻ Otočit (R)", "↻ Rotate (R)"), delegate { RotateSel(); }, sel.Count == 1);
+            mi(L.T("⧉ Duplikovat (Ctrl+D)", "⧉ Duplicate (Ctrl+D)"), delegate { Duplicate(); }, sel.Count == 1);
+            mi(L.T("🔧 Opravit", "🔧 Repair") + n, delegate { RepairSel(); }, true);
+            m.Items.Add(new ToolStripSeparator());
+            mi(L.T("✕ Smazat (Del)", "✕ Delete (Del)") + n, delegate { DeleteSel(); }, true);
+            m.Closed += delegate { BeginInvoke((Action)(() => m.Dispose())); };
+            m.Show(screen);
+        }
+
+        /// <summary>Drop from the grid: same container = reposition, other container (even other save) = move.</summary>
+        public void DropItem(InvItem it, MainContainer target, GridElement ge, int row, int col, bool rotated)
+        {
+            var s = target.Save;
+            int w = rotated ? it.BaseH : it.BaseW, h = rotated ? it.BaseW : it.BaseH;
+            bool same = target == it.Container;
+            if (s.IsInside(target, it)) { status.Text = L.T("Předmět nejde vložit sám do sebe.", "An item can't go inside itself."); grid.Invalidate(); return; }
+            if (!s.Fits(target, ge, row, col, w, h, same ? it : null)) { status.Text = L.T("Sem se to nevejde.", "It doesn't fit here."); grid.Invalidate(); return; }
+            Checkpoint(L.T("Přesun ", "Move ") + it.DisplayName);
+            if (same)
+            {
+                it.ContainerIndex = ge.Index; it.SlotIndex = row * ge.Cols + col; it.Rotated = rotated;
+                Changed(it);
+                SelectItem(it, true);
+                UpdateGridStats();
+                return;
+            }
+            var moved = InvSave.Move(it, target, ge.Index, row * ge.Cols + col, rotated);
+            status.Text = L.T("Přesunuto do: ", "Moved to: ") + target.Title;
+            StructureChanged(moved);
+        }
+
+        void MoveSelectionTo(MainContainer target)
+        {
+            var uids = Selection().Select(x => x.UidKey).ToList();
+            if (uids.Count == 0) return;
+            string targetUid = target.UidKey; var ts = target.Save;
+            Checkpoint(L.T("Přesun do ", "Move to ") + target.Title);
+            int ok = 0, failed = 0; InvItem last = null;
+            foreach (var uid in uids)
+            {
+                var it = FindItem(uid);
+                MainContainer tgt;
+                if (it == null || !ts.ByUid.TryGetValue(targetUid, out tgt)) continue;
+                if (it.Container == tgt || ts.IsInside(tgt, it)) continue;
+                var spot = ts.FindSpot(tgt, it.BaseW, it.BaseH, null, -1);
+                if (spot == null) { failed++; continue; }
+                last = InvSave.Move(it, tgt, spot[0], spot[1], spot[2] == 1);
+                ok++;
+            }
+            if (ok == 0) undo.Discard();
+            status.Text = L.T("Přesunuto: " + ok + (failed > 0 ? ", nevešlo se: " + failed : ""), "Moved: " + ok + (failed > 0 ? ", didn't fit: " + failed : ""));
+            StructureChanged(last);
         }
 
         void DeleteSel()
         {
-            if (selItem == null) return;
-            var s = selItem.Container.Save;
-            int sub = s.Descendants(selItem).Count();
-            if (sub > 0 && DarkMsg.Show(this, L.T("Smazat " + selItem.DisplayName + " včetně " + sub + " vnořených předmětů?", "Delete " + selItem.DisplayName + " including " + sub + " nested items?"), L.T("Smazat", "Delete"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            s.RemoveItem(selItem);
-            StructureChanged(null);
+            var sel = Selection();
+            if (sel.Count == 0) return;
+            int nested = sel.Sum(x => x.Container.Save.Descendants(x).Count());
+            if ((sel.Count > 1 || nested > 0) && DarkMsg.Show(this,
+                    L.T("Smazat " + (sel.Count == 1 ? sel[0].DisplayName : sel.Count + " předmětů") + (nested > 0 ? " včetně " + nested + " vnořených" : "") + "?\n(Jde vrátit přes Zpět.)",
+                        "Delete " + (sel.Count == 1 ? sel[0].DisplayName : sel.Count + " items") + (nested > 0 ? " including " + nested + " nested" : "") + "?\n(Can be undone.)"),
+                    L.T("Smazat", "Delete"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            Checkpoint(L.T("Smazat ", "Delete ") + (sel.Count == 1 ? sel[0].DisplayName : sel.Count + L.T(" předmětů", " items")));
+            foreach (var uid in sel.Select(x => x.UidKey).ToList())
+            {
+                var it = FindItem(uid);
+                if (it == null) continue;
+                var s = it.Container.Save;
+                s.RemoveItem(it); s.Rebuild();
+            }
+            StructureChanged((string)null);
+        }
+
+        void RepairSel()
+        {
+            var sel = Selection();
+            if (sel.Count == 0) return;
+            Checkpoint(L.T("Opravit", "Repair"));
+            int n = 0;
+            foreach (var it in sel) { if (Tools.Repair(it)) { n++; it.Container.Save.Dirty = true; } }
+            if (n == 0) { undo.Discard(); UpdateUndoButtons(); status.Text = L.T("Není co opravovat.", "Nothing to repair."); return; }
+            status.Text = L.T("Opraveno: ", "Repaired: ") + n;
+            grid.Invalidate(); ShowDetails(selItem); UpdateTitle();
         }
 
         void RotateSel()
@@ -655,7 +1019,7 @@ namespace IrrEditor
             var ge = it.Container.Elements.FirstOrDefault(e => e.Index == it.ContainerIndex);
             if (ge == null || !ge.IsGrid) return;
             int r = it.SlotIndex / ge.Cols, c = it.SlotIndex % ge.Cols;
-            if (it.Container.Save.Fits(it.Container, ge, r, c, it.H, it.W, it)) { it.Rotated = !it.Rotated; Changed(it); }
+            if (it.Container.Save.Fits(it.Container, ge, r, c, it.H, it.W, it)) { Checkpoint(L.T("Otočit", "Rotate")); it.Rotated = !it.Rotated; Changed(it); }
             else status.Text = L.T("Otočení se nevejde – není tam místo.", "Can't rotate – there's no room.");
         }
 
@@ -668,39 +1032,47 @@ namespace IrrEditor
             var t = s.TemplateOf(selItem);
             var spot = s.FindSpot(target, selItem.BaseW, selItem.BaseH, null, -1);
             if (spot == null) { DarkMsg.Show(this, L.T("V kontejneru už není místo.", "The container is full."), L.T("Duplikovat", "Duplicate")); return; }
+            Checkpoint(L.T("Duplikovat ", "Duplicate ") + selItem.DisplayName);
             var n = s.Insert(t, target, spot[0], spot[1], spot[2] == 1, 0);
             StructureChanged(n);
         }
 
         void AddItemDialog()
         {
-            if (curMC == null || !curMC.HasGrid) { DarkMsg.Show(this, loadoutView
-                ? L.T("V přehledu výbavy nejdřív klikni na předmět v batohu, vestě nebo pouzdře – do toho kontejneru se pak bude přidávat.",
-                      "In the loadout overview, first click an item in the backpack, rig or pouch – new items go into that container.")
-                : L.T("Nejdřív otevři kontejner s mřížkou (sklad, batoh, vestu…).", "Open a container with a grid first (stash, backpack, rig…)."), L.T("Přidat předmět", "Add item")); return; }
+            if (curMC == null || !curMC.HasGrid)
+            {
+                DarkMsg.Show(this, view == ViewKind.Loadout
+                    ? L.T("V přehledu výbavy nejdřív klikni na předmět v batohu, vestě nebo pouzdře – do toho kontejneru se pak bude přidávat.",
+                          "In the loadout overview, first click an item in the backpack, rig or pouch – new items go into that container.")
+                    : L.T("Nejdřív otevři kontejner s mřížkou (sklad, batoh, vestu…).", "Open a container with a grid first (stash, backpack, rig…)."), L.T("Přidat předmět", "Add item"));
+                return;
+            }
             using (var d = new AddItemForm(curMC.Title))
             {
                 if (d.ShowDialog(this) != DialogResult.OK || d.Chosen == null) return;
+                Checkpoint(L.T("Přidat ", "Add ") + d.Chosen.Name);
                 InvItem last = null;
                 int failed = 0;
+                string uid = curMC.UidKey; var s = curMC.Save;
                 for (int k = 0; k < d.Copies; k++)
                 {
-                    var e = d.Chosen;
-                    var spot = curMC.Save.FindSpot(curMC, e.W, e.H, null, -1);
+                    var target = s.ByUid[uid];
+                    var spot = s.FindSpot(target, d.Chosen.W, d.Chosen.H, null, -1);
                     if (spot == null) { failed = d.Copies - k; break; }
-                    last = curMC.Save.Insert(e.Template, curMC, spot[0], spot[1], spot[2] == 1, d.Count);
-                    // Insert rebuilt the save – refresh curMC reference
-                    curMC = curMC.Save.ByUid[curMC.UidKey];
+                    last = s.Insert(d.Chosen.Template, target, spot[0], spot[1], spot[2] == 1, d.Count);
                 }
+                if (last == null) undo.Discard();
                 StructureChanged(last);
                 if (failed > 0) DarkMsg.Show(this, L.T(failed + "× se nevešlo – kontejner je plný.", failed + "× didn't fit – the container is full."), L.T("Přidat předmět", "Add item"));
             }
         }
 
-        void Bulk(string label, Func<InvSave, int> f)
+        void Bulk(string undoLabel, string label, Func<InvSave, int> f)
         {
+            Checkpoint(undoLabel);
             int n = 0;
             foreach (var s in new[] { stash, inv }) if (s != null) n += f(s);
+            if (n == 0) undo.Discard();
             status.Text = label + ": " + n;
             StructureChanged(selItem);
         }
@@ -708,497 +1080,119 @@ namespace IrrEditor
         void MergeCur()
         {
             if (curMC == null) return;
+            Checkpoint(L.T("Sloučit stacky", "Merge stacks"));
             int removed = Tools.MergeStacks(curMC.Save, curMC);
             status.Text = L.T("Sloučeno – ušetřeno " + removed + " políček/stacků.", "Merged – " + removed + " stacks freed.");
-            StructureChanged(null);
+            StructureChanged((string)null);
         }
 
         void SortCur()
         {
             if (curMC == null || !curMC.HasGrid) return;
-            if (Tools.Sort(curMC.Save, curMC)) status.Text = L.T("Seřazeno.", "Sorted.");
-            else status.Text = L.T("Seřazení se nevešlo – nic se nezměnilo.", "Sorting didn't fit – nothing changed.");
+            Checkpoint(L.T("Seřadit ", "Sort ") + curMC.Title);
+            if (Tools.Sort(curMC.Save, curMC)) status.Text = L.T("Seřazeno: ", "Sorted: ") + curMC.Title;
+            else { undo.Discard(); status.Text = L.T("Seřazení se nevešlo – nic se nezměnilo.", "Sorting didn't fit – nothing changed."); }
             StructureChanged(selItem);
         }
 
         void UnlockPages()
         {
             if (stash == null) return;
-            if (DarkMsg.Show(this, L.T("Odemkne všechna políčka na zamčených stranách skladu.\nHra je může při dalším načtení znovu zamknout podle úrovně úkrytu. Pokračovat?",
-                                       "Unlocks every cell on the locked stash pages.\nThe game may lock them again on load, based on the hideout level. Continue?"),
+            if (DarkMsg.Show(this, L.T("Odemkne všechna zamčená políčka na stranách skladu.\nHra je může při dalším načtení znovu zamknout podle úrovně úkrytu. Pokračovat?",
+                                       "Unlocks every locked cell on the stash pages.\nThe game may lock them again on load, based on the hideout level. Continue?"),
                              L.T("Experimentální", "Experimental"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            Checkpoint(L.T("Odemknout sklad", "Unlock stash"));
             int n = Tools.UnlockStashPages(stash);
+            if (n == 0) undo.Discard();
             status.Text = L.T("Odemčeno stran: ", "Pages unlocked: ") + n;
-            StructureChanged(null);
+            StructureChanged((string)null);
         }
 
-        // called by grid on drop
-        public void MoveItem(InvItem it, GridElement ge, int row, int col, bool rotated)
+        // ---- weapon parts
+        void OpenParts()
         {
-            var s = it.Container.Save;
-            int w = rotated ? it.BaseH : it.BaseW, h = rotated ? it.BaseW : it.BaseH;
-            if (!s.Fits(it.Container, ge, row, col, w, h, it)) { status.Text = "Sem se to nevejde."; grid.Invalidate(); return; }
-            it.ContainerIndex = ge.Index;
-            it.SlotIndex = row * ge.Cols + col;
-            it.Rotated = rotated;
-            Changed(it);
-            SelectItem(it, true);
-        }
-    }
-
-    // ====================================================================== grid control
-    /// <summary>One block of the view: a whole container (its grids) or a single equipment slot.</summary>
-    public class GridSection
-    {
-        public MainContainer Mc;
-        public string Title;     // null = no header (single-container view)
-        public bool SlotOnly;    // equipment slot: show the one item it holds
-    }
-
-    public class GridPanel : Panel
-    {
-        class Block
-        {
-            public MainContainer Mc;
-            public GridElement Ge;   // null for a slot block
-            public Rectangle R;
-            public bool Slot { get { return Ge == null; } }
+            if (selItem == null) return;
+            var s = selItem.Container.Save; string uid = selItem.UidKey;
+            using (var f = new AttachForm(s, selItem, l => Checkpoint(l)))
+            {
+                f.ShowDialog(this);
+                if (f.Changed) { status.Text = L.T("Díly zbraně upraveny.", "Weapon parts changed."); StructureChanged(uid); }
+            }
         }
 
-        public MainForm Owner;
-        public InvItem Selected;
-        List<GridSection> sections = new List<GridSection>();
-        const int Cell = 56, Gap = 28, Pad = 16, HeadH = 24, CapH = 18;
-        readonly List<Block> blocks = new List<Block>();
-        readonly List<KeyValuePair<string, Point>> headers = new List<KeyValuePair<string, Point>>();
-        InvItem drag; int dragOffR, dragOffC; Point mouse; bool dragRot; bool dragging; Point downAt;
-        readonly ToolTip tip = Theme.MakeTip();
-        InvItem hover;
-
-        public GridPanel()
+        void DetachPart()
         {
-            DoubleBuffered = true;
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable, true);
-            TabStop = true;
+            var e = contents.SelectedItem as ContentEntry;
+            if (e == null) { status.Text = L.T("Nejdřív vyber díl v seznamu obsahu.", "Select a part in the contents list first."); return; }
+            var part = e.Item; string keep = selItem == null ? null : selItem.UidKey;
+            // first grid with room: the open container, the main stash, the other stash pages, then the loadout
+            var candidates = new List<MainContainer>();
+            if (curMC != null && curMC.HasGrid) candidates.Add(curMC);
+            if (MainStash != null) candidates.Add(MainStash);
+            foreach (var s in new[] { stash, inv }) if (s != null) candidates.AddRange(s.GridContainers().Select(k => k.Value));
+            foreach (var target in candidates.Distinct())
+            {
+                if (target.Save.IsInside(target, part)) continue;
+                var spot = target.Save.FindSpot(target, part.BaseW, part.BaseH, null, -1);
+                if (spot == null) continue;
+                Checkpoint(L.T("Sundat ", "Detach ") + part.DisplayName);
+                InvSave.Move(part, target, spot[0], spot[1], spot[2] == 1);
+                status.Text = L.T("Díl přesunut do: ", "Part moved to: ") + target.Title;
+                StructureChanged(keep);
+                return;
+            }
+            status.Text = L.T("Nikde není místo pro tento díl.", "There's no room for this part anywhere.");
         }
 
-        public void Show(MainContainer c)
+        // ---- windows
+        void OpenBase()
         {
-            Show(new List<GridSection> { new GridSection { Mc = c } });
+            if (baseData == null) return;
+            Checkpoint(L.T("Báze a reputace", "Base and reputation"));
+            using (var f = new BaseForm(baseData))
+            {
+                if (f.ShowDialog(this) == DialogResult.OK && f.Changed) { status.Text = L.T("Báze / reputace upravena – nezapomeň uložit.", "Base / reputation changed – don't forget to save."); UpdateTitle(); }
+                else undo.Discard();
+            }
+            UpdateUndoButtons();
         }
 
-        public void Show(List<GridSection> s)
+        void OpenGunsmith()
         {
-            sections = s; Selected = null; AutoScrollPosition = Point.Empty; DoLayout(); Invalidate();
+            if (gunsmith == null || !(gunsmith.G.Root["PresetMap"] is MapValue))
+            {
+                DarkMsg.Show(this, L.T("GunsmithSaveGame.sav nebyl nalezen nebo nemá presety.", "GunsmithSaveGame.sav was not found or has no presets."), L.T("Presety zbraní", "Weapon presets"));
+                return;
+            }
+            using (var f = new GunsmithForm(gunsmith, l => Checkpoint(l)))
+            {
+                f.ShowDialog(this);
+                if (f.Changed) status.Text = L.T("Presety upraveny – nezapomeň uložit.", "Presets changed – don't forget to save.");
+            }
+            UpdateTitle(); UpdateUndoButtons();
         }
 
-        /// <summary>Is this container visible in the current view?</summary>
-        public bool Shows(MainContainer m) { return m != null && sections.Any(s => s.Mc == m); }
-
-        protected override void OnResize(EventArgs e) { base.OnResize(e); DoLayout(); Invalidate(); }
-
-        void DoLayout()
+        void OpenBackups()
         {
-            blocks.Clear(); headers.Clear();
-            int maxW = Math.Max(ClientSize.Width - Pad, 300);
-            int x = Pad, y = Pad, rowH = 0;
-            using (var f = new Font("Segoe UI", 7f))
-            using (var hf = new Font("Segoe UI Semibold", 9.5f))
-                foreach (var s in sections)
+            if (dir == null) return;
+            if (AnyDirty() && !ConfirmDiscard()) return;
+            using (var f = new BackupForm(dir, BackupRoot()))
+                if (f.ShowDialog(this) == DialogResult.OK && f.Restored)
                 {
-                    // measure the section's blocks
-                    var sizes = new List<Size>();       // grid/slot rectangle size
-                    var widths = new List<int>();       // reserved width (caption may be wider)
-                    var elems = new List<GridElement>();
-                    if (s.SlotOnly)
-                    {
-                        var it = s.Mc.Items.FirstOrDefault();
-                        // equipment slots are drawn smaller than grid cells – they're just "what's equipped"
-                        const int SlotCell = 38;
-                        var sz = new Size(Math.Max(3, it == null ? 3 : it.W) * SlotCell, Math.Max(2, it == null ? 2 : it.H) * SlotCell);
-                        sizes.Add(sz); widths.Add(sz.Width); elems.Add(null);
-                    }
-                    else
-                        foreach (var ge in s.Mc.Elements.Where(e => e.IsGrid))
-                        {
-                            var sz = new Size(ge.Cols * Cell, ge.Rows * Cell);
-                            sizes.Add(sz);
-                            widths.Add(Math.Max(sz.Width, TextRenderer.MeasureText(ElementLabel(s.Mc, ge, 999), f).Width + 6));
-                            elems.Add(ge);
-                        }
-                    int headH = s.Title == null ? 0 : HeadH;
-                    int titleW = s.Title == null ? 0 : TextRenderer.MeasureText(s.Title, hf).Width + 8;
-                    int capH = s.SlotOnly ? 0 : CapH;
-                    int contentW = widths.Count == 0 ? 0 : widths.Sum() + Gap * (widths.Count - 1);
-                    int secW = Math.Max(titleW, Math.Min(contentW, maxW - Pad));
-
-                    if (x > Pad && x + secW > maxW) { x = Pad; y += rowH + Gap; rowH = 0; }
-                    if (s.Title != null) headers.Add(new KeyValuePair<string, Point>(s.Title, new Point(x, y)));
-
-                    // place blocks, wrapping inside the section when needed
-                    int bx = x, by = y + headH, lineH = 0, right = x + titleW;
-                    for (int i = 0; i < sizes.Count; i++)
-                    {
-                        if (bx > x && bx + widths[i] > x + secW) { bx = x; by += lineH + Gap; lineH = 0; }
-                        blocks.Add(new Block { Mc = s.Mc, Ge = elems[i], R = new Rectangle(new Point(bx, by + capH), sizes[i]) });
-                        right = Math.Max(right, bx + widths[i]);
-                        lineH = Math.Max(lineH, sizes[i].Height + capH);
-                        bx += widths[i] + Gap;
-                    }
-                    int secH = by + lineH - y;
-                    x = right + Gap + (s.Title != null ? 8 : 0);
-                    rowH = Math.Max(rowH, secH);
+                    LoadAll();
+                    status.Text = L.T("Savy obnoveny ze zálohy.", "Saves restored from backup.");
                 }
-            AutoScrollMinSize = new Size(blocks.Count == 0 ? 0 : blocks.Max(b => b.R.Right) + Pad, y + rowH + Pad);
         }
 
-        static string ElementLabel(MainContainer mc, GridElement ge, int free)
+        void SwitchLanguage(bool en)
         {
-            return (mc.Elements.Count(x => x.IsGrid) > 1 ? L.T("Část ", "Part ") + (ge.Index + 1) + " · " : "") + ge.Cols + "×" + ge.Rows + L.T(" · volno ", " · free ") + free;
-        }
-
-        Point Offset(Point p) { return new Point(p.X - AutoScrollPosition.X, p.Y - AutoScrollPosition.Y); }
-
-        Block HitCell(Point p, out int row, out int col)
-        {
-            p = Offset(p);
-            foreach (var b in blocks)
-                if (b.R.Contains(p)) { col = (p.X - b.R.X) / Cell; row = (p.Y - b.R.Y) / Cell; return b; }
-            row = col = -1; return null;
-        }
-
-        InvItem ItemAt(Point p)
-        {
-            int r, c;
-            var b = HitCell(p, out r, out c);
-            if (b == null) return null;
-            if (b.Slot) return b.Mc.Items.FirstOrDefault();
-            return b.Mc.Save.Occupancy(b.Mc, b.Ge, null)[r, c];
-        }
-
-        protected override void OnMouseDown(MouseEventArgs e)
-        {
-            Focus();
-            var it = ItemAt(e.Location);
-            Owner.SelectItem(it, true);
-            int r, c;
-            var b = HitCell(e.Location, out r, out c);
-            if (it != null && b != null && !b.Slot && e.Button == MouseButtons.Left)
-            {
-                drag = it; dragOffR = r - it.SlotIndex / b.Ge.Cols; dragOffC = c - it.SlotIndex % b.Ge.Cols; dragRot = it.Rotated;
-                downAt = e.Location; dragging = false;
-            }
-        }
-
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            mouse = e.Location;
-            if (drag != null && !dragging && (Math.Abs(e.X - downAt.X) > 4 || Math.Abs(e.Y - downAt.Y) > 4)) dragging = true;
-            if (dragging) { Invalidate(); return; }
-            var h = ItemAt(e.Location);
-            if (h != hover)
-            {
-                hover = h;
-                tip.SetToolTip(this, h == null ? null : h.DisplayName + (h.MaxStack > 1 || h.Count > 1 ? "  ×" + h.Count + "/" + h.MaxStack : "") + "\n" + h.Category
-                    + string.Concat(h.Stats.Where(s => s.ShortTag != "Weight").Take(6).Select(s => "\n" + s.ShortTag + ": " + s.Value.ToString("0.##"))));
-            }
-        }
-
-        // drop target is only valid inside the dragged item's own container
-        Block DropBlock(Point p, out int r, out int c)
-        {
-            var b = HitCell(p, out r, out c);
-            return b != null && !b.Slot && drag != null && b.Mc == drag.Container ? b : null;
-        }
-
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            if (dragging && drag != null)
-            {
-                int r, c;
-                var b = DropBlock(e.Location, out r, out c);
-                if (b != null)
-                {
-                    int offR = dragRot == drag.Rotated ? dragOffR : 0, offC = dragRot == drag.Rotated ? dragOffC : 0;
-                    Owner.MoveItem(drag, b.Ge, r - offR, c - offC, dragRot);
-                }
-            }
-            drag = null; dragging = false; Invalidate();
-        }
-
-        protected override void OnMouseDoubleClick(MouseEventArgs e)
-        {
-            var it = ItemAt(e.Location);
-            if (it != null) Owner.OpenItem(it);
-        }
-
-        protected override bool IsInputKey(Keys k) { return k == Keys.R || base.IsInputKey(k); }
-        protected override void OnKeyDown(KeyEventArgs e)
-        {
-            if (dragging && e.KeyCode == Keys.R) { dragRot = !dragRot; Invalidate(); e.Handled = true; return; }
-            base.OnKeyDown(e);
-        }
-
-        static Color CatColor(string cat)
-        {
-            if (cat.StartsWith("Weapons")) return Color.FromArgb(70, 98, 140);
-            if (cat.StartsWith("Attachments")) return Color.FromArgb(78, 88, 104);
-            if (cat.StartsWith("Ammunition")) return Color.FromArgb(150, 122, 50);
-            if (cat.StartsWith("Medical")) return Color.FromArgb(150, 60, 60);
-            if (cat.StartsWith("Gear")) return Color.FromArgb(70, 110, 72);
-            if (cat.StartsWith("Quest")) return Color.FromArgb(120, 78, 150);
-            if (cat.StartsWith("Money")) return Color.FromArgb(160, 140, 40);
-            if (cat.StartsWith("Keys")) return Color.FromArgb(40, 120, 120);
-            if (cat.StartsWith("Provisions")) return Color.FromArgb(130, 100, 60);
-            if (cat.StartsWith("Grenades")) return Color.FromArgb(110, 120, 50);
-            if (cat.StartsWith("Barter")) return Color.FromArgb(105, 90, 80);
-            return Color.FromArgb(90, 90, 90);
-        }
-
-        /// <summary>Word-wrap without breaking words; a word wider than the tile is cut with an ellipsis.
-        /// Lines that don't fit vertically are dropped and the last visible line gets an ellipsis.</summary>
-        static List<string> WrapLabel(Graphics g, string text, Font f, float width, int maxLines)
-        {
-            var lines = new List<string>();
-            if (maxLines <= 0) return lines;
-            var words = text.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            string cur = "";
-            Func<string, bool> fits = s => g.MeasureString(s, f, int.MaxValue, StringFormat.GenericTypographic).Width <= width;
-            Func<string, string> cut = s =>
-            {
-                if (fits(s)) return s;
-                for (int n = s.Length - 1; n > 0; n--) if (fits(s.Substring(0, n) + "…")) return s.Substring(0, n) + "…";
-                return "…";
-            };
-            int i = 0;
-            for (; i < words.Length; i++)
-            {
-                var w = words[i];
-                var cand = cur.Length == 0 ? w : cur + " " + w;
-                if (fits(cand)) { cur = cand; continue; }
-                if (cur.Length > 0) { lines.Add(cur); cur = ""; if (lines.Count == maxLines) break; }
-                if (fits(w)) cur = w; else { lines.Add(cut(w)); if (lines.Count == maxLines) { i++; break; } }
-            }
-            if (cur.Length > 0 && lines.Count < maxLines) { lines.Add(cur); i = words.Length; }
-            if (i < words.Length && lines.Count > 0)
-            {
-                var last = lines[lines.Count - 1];
-                lines[lines.Count - 1] = last.EndsWith("…") ? last : cut(last + "…");
-            }
-            return lines;
-        }
-
-        void DrawTile(Graphics g, InvItem it, Rectangle ir, Font small, Font bold, Brush white)
-        {
-            bool sel = it == Selected;
-            var col = CatColor(it.Category);
-            using (var b = new LinearGradientBrush(ir, ControlPaint.Light(col, 0.15f), col, LinearGradientMode.Vertical))
-            {
-                if (dragging && it == drag) { b.LinearColors = new[] { Color.FromArgb(70, col), Color.FromArgb(70, col) }; }
-                g.FillRectangle(b, ir);
-            }
-            using (var p = new Pen(sel ? Theme.Accent : Color.FromArgb(90, 255, 255, 255), sel ? 2f : 1f))
-                g.DrawRectangle(p, sel ? Rectangle.Inflate(ir, -1, -1) : ir);
-
-            // footer: [▣]  ............  [count]   + durability bar underneath
-            bool hasCount = it.MaxStack > 1 || it.Count > 1;
-            var sub = it.Container.Save.ContainerOf(it);
-            bool hasBox = sub != null && sub.HasGrid;
-            var d = it.GetStat("Durability");
-            bool hasBar = d != null && (it.Category.StartsWith("Weapons") || it.Category.StartsWith("Gear"));
-            int barH = hasBar ? 5 : 0;
-            int footH = (hasCount || hasBox) ? 13 : 0;
-
-            if (hasBar)
-            {
-                CatalogEntry ce;
-                float max = Catalog.Entries.TryGetValue(it.Def, out ce) && ce.NewDurability > 0 ? ce.NewDurability.Value : 100f;
-                float f = Math.Max(0, Math.Min(1, d.Value / max));
-                var track = new Rectangle(ir.X + 3, ir.Bottom - 5, ir.Width - 6, 3);
-                using (var tb = new SolidBrush(Color.FromArgb(90, 0, 0, 0))) g.FillRectangle(tb, track);
-                g.FillRectangle(f > 0.6f ? Brushes.LimeGreen : f > 0.3f ? Brushes.Orange : Brushes.Red, new Rectangle(track.X, track.Y, (int)(track.Width * f), 3));
-            }
-            int footTop = ir.Bottom - barH - footH;
-            float countW = 0;
-            if (hasCount)
-            {
-                var txt = it.Count >= 100000 ? (it.Count / 1000) + "k" : it.Count >= 10000 ? (Math.Floor(it.Count / 100.0) / 10).ToString("0.#") + "k" : it.Count.ToString();
-                var sz = g.MeasureString(txt, bold, int.MaxValue, StringFormat.GenericTypographic);
-                countW = sz.Width;
-                using (var cb = new SolidBrush(it.Count > it.MaxStack ? Theme.Warn : Color.White))
-                    g.DrawString(txt, bold, cb, ir.Right - sz.Width - 3, footTop, StringFormat.GenericTypographic);
-            }
-            if (hasBox && ir.Width - countW > 20)
-                using (var bb = new SolidBrush(Color.FromArgb(210, 255, 255, 255)))
-                    g.DrawString("▣", small, bb, ir.X + 2, footTop - 1, StringFormat.GenericTypographic);
-
-            // name: whatever lines fit above the footer
-            float lineH = small.GetHeight(g);
-            int top = ir.Y + 3;
-            int avail = footTop - top - 1;
-            int maxLines = Math.Max(1, (int)(avail / lineH));
-            var lines = WrapLabel(g, it.DisplayName, small, ir.Width - 7, maxLines);
-            var prevClip = g.Clip;
-            g.SetClip(new Rectangle(ir.X + 1, ir.Y + 1, ir.Width - 2, Math.Max(lineH > avail ? (int)lineH : avail, 1) + 2));
-            for (int k = 0; k < lines.Count; k++)
-                g.DrawString(lines[k], small, white, ir.X + 3, top + k * lineH, StringFormat.GenericTypographic);
-            g.Clip = prevClip;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.TranslateTransform(AutoScrollPosition.X, AutoScrollPosition.Y);
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-            using (var gridPen = new Pen(Color.FromArgb(60, 64, 70)))
-            using (var slotPen = new Pen(Color.FromArgb(80, 86, 96)) { DashStyle = DashStyle.Dash })
-            using (var cellBg = new SolidBrush(Color.FromArgb(38, 41, 45)))
-            using (var hatch = new HatchBrush(HatchStyle.BackwardDiagonal, Color.FromArgb(70, 50, 50), Color.FromArgb(32, 32, 34)))
-            using (var small = new Font("Segoe UI", 7f))
-            using (var bold = new Font("Segoe UI Semibold", 8f))
-            using (var head = new Font("Segoe UI Semibold", 9.5f))
-            using (var white = new SolidBrush(Color.White))
-            using (var label = new SolidBrush(Theme.TextDim))
-            using (var headBrush = new SolidBrush(Theme.Accent))
-            {
-                if (blocks.Count == 0)
-                    g.DrawString(L.T("Tento kontejner nemá mřížku (sloty zbraně / výbavy). Obsah je vidět ve stromu vlevo.",
-                                     "This container has no grid (weapon / gear slots). Its contents are listed in the tree on the left."), Font, label, Pad, Pad);
-                foreach (var h in headers)
-                    g.DrawString(h.Key, head, headBrush, h.Value.X, h.Value.Y + 2);
-                foreach (var b in blocks)
-                {
-                    var R = b.R;
-                    if (b.Slot)
-                    {
-                        g.FillRectangle(cellBg, R);
-                        var it = b.Mc.Items.FirstOrDefault();
-                        if (it == null)
-                        {
-                            g.DrawRectangle(slotPen, R);
-                            g.DrawString(L.T("prázdné", "empty"), small, label, R.X + 6, R.Y + 6);
-                        }
-                        else DrawTile(g, it, Rectangle.Inflate(R, -2, -2), small, bold, white);
-                        continue;
-                    }
-                    var ge = b.Ge; var mc = b.Mc;
-                    int free = 0; var occ = mc.Save.Occupancy(mc, ge, null);
-                    for (int r = 0; r < ge.Rows; r++) for (int c = 0; c < ge.Cols; c++) if (ge.Enabled[r, c] && occ[r, c] == null) free++;
-                    g.DrawString(ElementLabel(mc, ge, free), small, label, R.X, R.Y - 16);
-                    for (int r = 0; r < ge.Rows; r++)
-                        for (int c = 0; c < ge.Cols; c++)
-                        {
-                            var cr = new Rectangle(R.X + c * Cell, R.Y + r * Cell, Cell, Cell);
-                            g.FillRectangle(ge.Enabled[r, c] ? (Brush)cellBg : hatch, cr);
-                            g.DrawRectangle(gridPen, cr);
-                        }
-                    foreach (var it in mc.Items.Where(i => i.ContainerIndex == ge.Index && i.SlotIndex >= 0))
-                    {
-                        int r0 = it.SlotIndex / ge.Cols, c0 = it.SlotIndex % ge.Cols;
-                        var ir = new Rectangle(R.X + c0 * Cell + 2, R.Y + r0 * Cell + 2, it.W * Cell - 4, it.H * Cell - 4);
-                        DrawTile(g, it, ir, small, bold, white);
-                    }
-                }
-                // drag ghost
-                if (dragging && drag != null)
-                {
-                    int r, c;
-                    var b = DropBlock(mouse, out r, out c);
-                    if (b != null)
-                    {
-                        int offR = dragRot == drag.Rotated ? dragOffR : 0, offC = dragRot == drag.Rotated ? dragOffC : 0;
-                        int w = dragRot ? drag.BaseH : drag.BaseW, h = dragRot ? drag.BaseW : drag.BaseH;
-                        int tr = r - offR, tc = c - offC;
-                        bool ok = b.Mc.Save.Fits(b.Mc, b.Ge, tr, tc, w, h, drag);
-                        var gr = new Rectangle(b.R.X + tc * Cell + 2, b.R.Y + tr * Cell + 2, w * Cell - 4, h * Cell - 4);
-                        using (var gb = new SolidBrush(ok ? Color.FromArgb(110, 80, 200, 120) : Color.FromArgb(110, 220, 60, 60)))
-                            g.FillRectangle(gb, gr);
-                        g.DrawString(drag.DisplayName + L.T("   (R = otočit)", "   (R = rotate)"), small, white, gr.X + 3, gr.Y + 2);
-                    }
-                }
-            }
-        }
-    }
-
-    // ====================================================================== add dialog
-    public class AddItemForm : Form
-    {
-        TextBox search; ComboBox cat; ListView list; NumBox count, copies; Label info;
-        public CatalogEntry Chosen; public int Count; public int Copies;
-
-        public AddItemForm(string targetTitle)
-        {
-            Text = L.T("Přidat předmět do: ", "Add item to: ") + targetTitle;
-            Width = 820; Height = 640; StartPosition = FormStartPosition.CenterParent; Font = new Font("Segoe UI", 9f);
-            MinimizeBox = false; ShowInTaskbar = false;
-            var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(8, 10, 8, 0), WrapContents = false };
-            search = new TextBox { Width = 320, Margin = new Padding(6, 0, 8, 0) };
-            cat = new ComboBox { Width = 240, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0) };
-            cat.Items.Add(L.T("(všechny kategorie)", "(all categories)"));
-            foreach (var c in Catalog.Entries.Values.Select(e => e.Category).Distinct().OrderBy(x => x)) cat.Items.Add(c);
-            cat.SelectedIndex = 0;
-            top.Controls.Add(new Label { Text = L.T("Hledat:", "Search:"), AutoSize = true, Margin = new Padding(0, 3, 0, 0) });
-            top.Controls.Add(search); top.Controls.Add(cat);
-
-            list = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HideSelection = false, MultiSelect = false };
-            list.Columns.Add(L.T("Název", "Name"), 300); list.Columns.Add(L.T("Kategorie", "Category"), 170); list.Columns.Add(L.T("Velikost", "Size"), 70);
-            list.Columns.Add("Max stack", 80); list.Columns.Add(L.T("Díly", "Parts"), 50); list.Columns.Add(L.T("Zdroj", "Source"), 80);
-
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 52, Padding = new Padding(8, 10, 8, 8), FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
-            count = new NumBox { Minimum = 1, Maximum = int.MaxValue, Width = 110, ThousandsSeparator = true, Margin = new Padding(4, 4, 4, 0) };
-            copies = new NumBox { Minimum = 1, Maximum = 100, Width = 60, Value = 1, Margin = new Padding(4, 4, 12, 0) };
-            var ok = new Button { Text = L.T("Přidat", "Add"), DialogResult = DialogResult.OK, Width = 100, Height = 30, Margin = new Padding(4, 0, 4, 0) };
-            var cancel = new Button { Text = L.T("Zrušit", "Cancel"), DialogResult = DialogResult.Cancel, Width = 90, Height = 30, Margin = new Padding(4, 0, 4, 0) };
-            info = new Label { AutoSize = true, Margin = new Padding(12, 7, 0, 0) };
-            bottom.Controls.Add(new Label { Text = L.T("Počet ve stacku:", "Stack count:"), AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
-            bottom.Controls.Add(count);
-            bottom.Controls.Add(new Label { Text = L.T("Kusů:", "Copies:"), AutoSize = true, Margin = new Padding(8, 7, 0, 0) });
-            bottom.Controls.Add(copies);
-            bottom.Controls.Add(ok); bottom.Controls.Add(cancel); bottom.Controls.Add(info);
-            AcceptButton = ok; CancelButton = cancel;
-
-            Controls.Add(list); Controls.Add(top); Controls.Add(bottom);
-            search.TextChanged += delegate { Fill(); };
-            cat.SelectedIndexChanged += delegate { Fill(); };
-            list.SelectedIndexChanged += delegate { OnPick(); };
-            list.DoubleClick += delegate { if (list.SelectedItems.Count > 0) { DialogResult = DialogResult.OK; Close(); } };
-            FormClosing += delegate
-            {
-                if (DialogResult != DialogResult.OK) return;
-                Chosen = list.SelectedItems.Count > 0 ? (CatalogEntry)list.SelectedItems[0].Tag : null;
-                Count = (int)count.Value; Copies = (int)copies.Value;
-            };
-            Shown += delegate { search.Focus(); };
-            Theme.Apply(this);
-            Theme.OwnerDrawListView(list);
-            Theme.OwnerDrawCombo(cat);
-            info.ForeColor = Theme.TextDim;
-            ok.BackColor = Theme.AccentBg; ok.FlatAppearance.BorderColor = Theme.Accent;
-            Fill();
-        }
-
-        void Fill()
-        {
-            var q = search.Text.Trim().ToLowerInvariant();
-            var c = cat.SelectedIndex > 0 ? (string)cat.SelectedItem : null;
-            list.BeginUpdate(); list.Items.Clear();
-            foreach (var e in Catalog.Entries.Values.Where(e => (c == null || e.Category == c) && (q.Length == 0 || e.Name.ToLowerInvariant().Contains(q) || e.IdName.ToLowerInvariant().Contains(q)))
-                                                      .OrderBy(e => e.Category).ThenBy(e => e.Name))
-            {
-                var li = new ListViewItem(new[] { e.Name, e.Category, e.W + "×" + e.H, e.MaxStack.ToString(), e.AttachmentCount > 0 ? e.AttachmentCount.ToString() : "", e.Template.Source == "Vendor" ? L.T("obchod", "vendor") : L.T("tvoje savy", "your saves") });
-                li.Tag = e; list.Items.Add(li);
-            }
-            list.EndUpdate();
-            info.Text = list.Items.Count + L.T(" položek", " items");
-        }
-
-        void OnPick()
-        {
-            if (list.SelectedItems.Count == 0) return;
-            var e = (CatalogEntry)list.SelectedItems[0].Tag;
-            count.Value = Math.Max(1, e.MaxStack);
-            info.Text = e.AttachmentCount > 0 ? L.T("přidá se kompletně sestavené (" + e.AttachmentCount + " dílů)", "added fully assembled (" + e.AttachmentCount + " parts)") : "";
+            if (en == L.En) return;
+            if (AnyDirty() && DarkMsg.Show(this, L.T("Přepnutí jazyka znovu načte savy a neuložené změny se zahodí. Pokračovat?", "Switching language reloads the saves and discards unsaved changes. Continue?"),
+                                           L.T("Jazyk", "Language"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            L.Save(en);
+            RestartRequested = true;
+            discardOnClose = true;
+            Close();
         }
     }
 

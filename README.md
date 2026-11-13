@@ -3,77 +3,92 @@
 <h1 align="center">IRR Inventory Editor</h1>
 
 <p align="center">
-Unofficial save editor for <b>Incursion Red River</b> – stash, character loadout, hideout and faction reputation.<br>
-Dark UI · English / Čeština · no install, no dependencies
+Unofficial save editor for <b>Incursion Red River</b>: stash, character loadout, weapon parts, hideout and faction reputation.<br>
+Dark, DPI-sharp UI · English / Čeština · no install, no dependencies
 </p>
 
-![Character loadout overview](docs/screenshot-loadout.png)
+![Character loadout with weapon details](docs/screenshot-loadout.png)
 
 ## Download
 
-Grab `IRR-InventoryEditor.zip` from **Releases**, unzip it anywhere and run `IRR-InventoryEditor.exe`.
-Windows only. It needs .NET Framework 4.x, which ships with Windows 10 and 11.
+Download `IRR-InventoryEditor.zip` from the [latest release](../../releases/latest), unzip it anywhere and run `IRR-InventoryEditor.exe`.
+Windows 10/11 only. It needs .NET Framework 4.x, which ships with Windows.
 
 > SmartScreen may warn the first time because the exe isn't signed: **More info → Run anyway**.
 
-The editor finds the saves automatically in `%LOCALAPPDATA%\Test_C\Saved\SaveGames` (`Test_C` is the game's internal name). To use a different folder, click **📂 Folder…**.
+The editor finds your saves automatically in `%LOCALAPPDATA%\Test_C\Saved\SaveGames` (`Test_C` is the game's internal name). To use another folder, click **📂 Folder…**.
 
 ## Features
 
-**Stash & loadout**
-- Visual grid of the stash, backpack, rig and pouch: colour by category, stack counts and a durability bar.
-- Drag items to move them, press **R** to rotate, double-click to open a backpack or rig.
-- **Character loadout overview**: every equipment slot and the contents of rig, pouch and backpack on one screen.
-- Item details: edit count, max stack, quest flag and every stat (durability, ergonomics, recoil…).
-- **Add item** (Ins) from a catalog of ~800 items, built from the vendor offers in your own saves:
-  - weapons come fully assembled, with magazine and ammo,
-  - items are auto-placed in the first free spot, rotated if needed, and get fresh UIDs.
-- **Duplicate** (Ctrl+D) and **Delete** (Del), including nested contents. Delete also clears quick-slot references.
-- **Smart tools**:
-  - repair all to new-item durability,
-  - fill stacks,
-  - fill magazines (capacity read from the name),
-  - merge stacks,
-  - sort a container,
-  - check for overlaps,
-  - unlock stash pages (experimental).
+### Stash & loadout
+![All stash pages side by side](docs/screenshot-stash.png)
 
-**🏠 Base & reputation**
+- **Visual grids** for the stash (every page side by side), backpack, rig and pouch. Tiles are coloured by category and show the stack count and a durability bar.
+- **Move anything anywhere**:
+  - drag items between stash pages, backpack, rig and pouch,
+  - or right-click → *Move to…*, which also works between the stash and the character loadout.
+- **Character loadout overview**: every equipment slot plus the contents of the rig, pouch and backpack.
+- **Multi-select** with Ctrl+click or by dragging a box on empty space. Delete, Repair and Move then apply to all selected items.
+- **Undo / Redo** (Ctrl+Z / Ctrl+Y) for every change.
+- **Search** (Ctrl+F): matching items are highlighted in the grid and the tree, and Enter jumps to the next one.
+- **Zoom** the grid with Ctrl+wheel or the − / + buttons.
+- **Item details**: edit count, max stack, quest flag and every stat (durability, ergonomics, recoil…).
 
-![Base, resources and reputation](docs/screenshot-base.png)
+### Adding items
+![Add item](docs/screenshot-add.png)
 
-- Hideout facility levels (−1 = not built) and the "track" flag. You can clear the cached "needed for next level" requirements (experimental).
-- Hideout resources: oil, concrete, metal and food, plus their maximums.
+- Pick from a catalog of ~800 items, built from the vendor stock in your own saves.
+- Set the stack size by **typing it or with a slider**, and add several copies at once.
+- Weapons come **fully assembled** with magazine and ammo. Items are auto-placed in the first free spot (rotated if needed) and get fresh UIDs.
+
+### Weapon parts & presets
+![Weapon parts](docs/screenshot-parts.png)
+
+- **Attach, swap or remove parts** on any weapon. Compatibility is learnt from what the game itself mounts on that weapon, so you only see parts that fit.
+- **Detach** a part straight into the stash.
+- **Gunsmith presets**: browse, rename, duplicate and delete.
+
+### 🏠 Base & reputation
+- Hideout facility levels (−1 = not built) and the "track" flag. Cached upgrade requirements can be cleared (experimental).
+- Hideout resources (oil, concrete, metal, food) and their maximums.
 - Player level, XP and loyalty with GREYFOR, BLUEFOR, OPFOR and FANG.
+
+### Smart tools
+- Repair everything to new-item durability.
+- Fill all stacks, or fill magazines (capacity is read from the name).
+- Merge stacks and sort a container.
+- Check for overlaps.
+- Unlock stash cells (experimental).
 
 ## Safety
 
-- The **whole save folder is backed up** to `SaveGames\_IRR_Editor_Backups\<timestamp>\` before every save.
-- Saving is blocked **while the game is running**.
-- The GVAS parser is **lossless**: an unmodified save is written back byte-for-byte identical. Every written file is parsed again before it replaces the original.
+- The **whole save folder is backed up** to `SaveGames\_IRR_Editor_Backups\<timestamp>\` before every save. **🗂 Backups** lists them and restores one with a click; your current saves are backed up first.
+- Saving is blocked while the game is running. If the game wrote the saves while the editor was open, the editor notices and asks before overwriting.
+- The GVAS parser is **lossless**: an unmodified save is written back byte-for-byte identical, and every written file is parsed again before it replaces the original.
 - `VendorSaveGame.sav` is only read, never written.
-- The game uses Steam Cloud. Only edit while the game is closed, and if Steam reports a conflict, choose the local files.
+- Steam Cloud: only edit while the game is closed. If Steam reports a conflict, choose the local files.
 
 ## Build from source
 
-No SDK needed. The C# compiler that ships with Windows is enough:
+No SDK is needed; the C# compiler that ships with Windows is enough:
 
 ```bat
 build.bat
 ```
 
-The icon is generated by `tools/MakeIcon.cs`.
+Every push is built by GitHub Actions, and pushing a `v*` tag publishes a release automatically. The icon is generated by `tools/MakeIcon.cs`.
 
 | File | Contents |
 |---|---|
 | `src/Gvas.cs` | Lossless reader/writer for UE 5.4+ GVAS saves (new property-tag format, maps, sets) |
-| `src/Model.cs` | Containers, grids, items, catalog, template cloning |
+| `src/Model.cs` | Containers, grids, items, catalog, part compatibility, moving and cloning |
+| `src/Undo.cs` | Snapshot-based undo / redo |
 | `src/Tools.cs` | Bulk "smart" operations |
-| `src/Base.cs` | Hideout / resources / reputation model and window |
-| `src/Theme.cs` | Dark theme, dark dialogs, tooltips, number input |
-| `src/Lang.cs` | Czech / English strings |
-| `src/MainForm.cs` | Main window and grid view |
-| `src/Dump.cs`, `src/Analyze.cs` | Developer tools (tree dump, round-trip test) |
+| `src/Base.cs`, `src/Gunsmith.cs` | Hideout / resources / reputation, weapon presets |
+| `src/GridPanel.cs` | The custom-drawn inventory grid |
+| `src/MainForm.cs`, `src/AddItemForm.cs`, `src/Dialogs.cs` | Windows and dialogs |
+| `src/Theme.cs`, `src/Lang.cs` | Dark theme and DPI scaling, Czech / English strings |
+| `src/Dump.cs`, `src/Analyze.cs`, `src/Shots.cs` | Developer tools (tree dump, round-trip and feature tests, off-screen screenshots) |
 
 ## License
 
@@ -88,9 +103,12 @@ This is a fan-made tool, **not affiliated with Games Farm**. Use it at your own 
 ### Česky
 
 Neoficiální editor savů pro Incursion Red River. Umí:
-- sklad, výbavu postavy a batohy v mřížce s přetahováním,
-- přidávání předmětů z katalogu, zbraně včetně kompletně sestavených dílů,
-- chytré nástroje (opravy, doplnění stacků a zásobníků, řazení),
+- sklad (všechny strany vedle sebe), výbavu, batoh a vestu v přehledných mřížkách,
+- přesouvání předmětů mezi kontejnery, a to i mezi skladem a výbavou,
+- vícenásobný výběr a Zpět/Znovu,
+- hledání a zoom,
+- přidávání předmětů s posuvníkem pro počet,
+- nasazování a výměnu dílů zbraní a presety Gunsmithu,
 - úrovně zařízení v úkrytu, suroviny, level postavy a loajalitu frakcí.
 
-Jazyk přepneš vpravo nahoře (🌐). Před každým uložením se savy zálohují do `SaveGames\_IRR_Editor_Backups`. Ukládej jen se zavřenou hrou.
+Jazyk přepneš vpravo nahoře (🌐). Před každým uložením se savy zálohují a z okna **🗂 Zálohy** je obnovíš jedním kliknutím. Ukládej jen se zavřenou hrou.

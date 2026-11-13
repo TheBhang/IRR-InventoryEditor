@@ -10,8 +10,10 @@ using System.Windows.Forms;
 namespace IrrEditor
 {
     /// <summary>A non-inventory save file edited as a property tree.</summary>
-    public class SaveDoc
+    public class SaveDoc : IUndoTarget
     {
+        public GvasFile Gvas { get { return G; } set { G = value; } }
+        public bool IsDirty { get { return Dirty; } set { Dirty = value; } }
         public string Path;
         public GvasFile G;
         public bool Dirty;
@@ -75,12 +77,15 @@ namespace IrrEditor
 
         public static BaseData Load(string dir)
         {
-            var b = new BaseData
-            {
-                Hideout = SaveDoc.TryLoad(System.IO.Path.Combine(dir, "SafeHouseSaveGame.sav")),
-                Resource = SaveDoc.TryLoad(System.IO.Path.Combine(dir, "ResourceSaveGame.sav")),
-                Mission = SaveDoc.TryLoad(System.IO.Path.Combine(dir, "MissionSaveGame.sav")),
-            };
+            return Build(SaveDoc.TryLoad(System.IO.Path.Combine(dir, "SafeHouseSaveGame.sav")),
+                         SaveDoc.TryLoad(System.IO.Path.Combine(dir, "ResourceSaveGame.sav")),
+                         SaveDoc.TryLoad(System.IO.Path.Combine(dir, "MissionSaveGame.sav")));
+        }
+
+        /// <summary>(Re)bind the view model to already loaded documents – used after undo/redo.</summary>
+        public static BaseData Build(SaveDoc hideout, SaveDoc resource, SaveDoc mission)
+        {
+            var b = new BaseData { Hideout = hideout, Resource = resource, Mission = mission };
             // hideout
             var levels = Map(b.Hideout == null ? null : b.Hideout.G, "HideoutUnitLevels");
             var tracked = Map(b.Hideout == null ? null : b.Hideout.G, "HideoutUnitTracked");
@@ -158,6 +163,7 @@ namespace IrrEditor
         public BaseForm(BaseData d)
         {
             data = d;
+            Theme.DpiForm(this);
             Text = L.T("Báze, suroviny a reputace", "Base, resources and reputation");
             Width = 1100; Height = 820; MinimumSize = new Size(900, 650);
             StartPosition = FormStartPosition.CenterParent; Font = new Font("Segoe UI", 9.5f);
@@ -274,8 +280,8 @@ namespace IrrEditor
                 Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false, AllowUserToResizeRows = false,
                 RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = true, EditMode = DataGridViewEditMode.EditOnEnter,
-                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing, ColumnHeadersHeight = 30,
-                RowTemplate = { Height = 28 }
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing, ColumnHeadersHeight = Theme.S(30),
+                RowTemplate = { Height = Theme.S(28) }
             };
         }
         static DataGridViewTextBoxColumn TextCol(string name, string header, bool ro, int weight)

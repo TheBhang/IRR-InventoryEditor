@@ -1,7 +1,8 @@
-// Dev tool: round-trip check + tree dump.  usage: dump.exe roundtrip <files...> | dump.exe tree <file> [maxArrayItems]
+﻿// Dev tool: round-trip check + tree dump.  usage: dump.exe roundtrip <files...> | dump.exe tree <file> [maxArrayItems]
 using System;
 using System.IO;
 using System.Linq;
+using System.Collections.Generic;
 using System.Text;
 
 namespace IrrEditor
@@ -11,6 +12,7 @@ namespace IrrEditor
         static int MaxItems = 3;
         static StringBuilder sb = new StringBuilder();
 
+        [STAThread]
         static int Main(string[] args)
         {
             if (args[0] == "roundtrip")
@@ -30,6 +32,85 @@ namespace IrrEditor
                 return bad;
             }
             if (args[0] == "analyze") { Analyze.Run(args[1]); return 0; }
+            if (args[0] == "shots") { Shots.Run(args[1], args[2], args.Length > 3 && args[3] == "en"); return 0; }
+            if (args[0] == "features")
+            {
+                // headless checks of the v1.2 features on a copy of the saves
+                string dir = args[1];
+                var stash = InvSave.Load(Path.Combine(dir, "StashSaveGame.sav"), "Stash");
+                var inv = InvSave.Load(Path.Combine(dir, "InventorySaveGame.sav"), "Inventory");
+                var vend = InvSave.Load(Path.Combine(dir, "VendorSaveGame.sav"), "Vendor");
+                var gun = SaveDoc.TryLoad(Path.Combine(dir, "GunsmithSaveGame.sav"));
+                Catalog.Build(new[] { vend, stash, inv });
+                Console.WriteLine("sockets learnt: " + Catalog.Sockets.Count);
+                var origStash = stash.G.ToBytes(); var origInv = inv.G.ToBytes();
+                var undo = new UndoStack(() => new List<IUndoTarget> { stash, inv }, () => { stash.Rebuild(); inv.Rebuild(); });
+
+                // 1) cross-save move: a stash item into the backpack, then a weapon (with parts) from loadout to stash
+                var main = stash.Containers.First(c => c.IsTopLevel && c.HasGrid);
+                var small = main.Items.First(i => i.BaseW == 1 && i.BaseH == 1 && stash.ContainerOf(i) == null);
+                var pack = inv.GridContainers().Select(k => k.Value).First(c => c.OwnerItem != null && c.OwnerItem.IdName.Contains("Backpack"));
+                var spot = inv.FindSpot(pack, 1, 1, null, -1);
+                undo.Checkpoint("move1");
+                int sBefore = stash.ItemsByUid.Count, iBefore = inv.ItemsByUid.Count;
+                var moved = InvSave.Move(small, pack, spot[0], spot[1], spot[2] == 1);
+                Console.WriteLine("move stash->backpack: " + moved.DisplayName + " stash " + sBefore + "->" + stash.ItemsByUid.Count + ", inv " + iBefore + "->" + inv.ItemsByUid.Count + ", in pack: " + (moved.Container.UidKey == pack.UidKey));
+                var wpn = inv.ItemsByUid.Values.First(i => i.Category.StartsWith("Weapons") && inv.Descendants(i).Count() > 3);
+                int parts = inv.Descendants(wpn).Count();
+                main = stash.Containers.First(c => c.IsTopLevel && c.HasGrid);
+                var ws = stash.FindSpot(main, wpn.BaseW, wpn.BaseH, null, -1);
+                undo.Checkpoint("move2");
+                var mw = InvSave.Move(wpn, main, ws[0], ws[1], ws[2] == 1);
+                Console.WriteLine("move weapon loadout->stash: " + mw.DisplayName + " parts " + parts + " -> " + stash.Descendants(mw).Count() + ", issues " + (stash.Validate().Count + inv.Validate().Count));
+                // same-save move between stash pages
+                var page = stash.TopUids.Select(k => stash.ByUid[k]).First(c => c != stash.Containers.First(x => x.IsTopLevel && x.HasGrid) && c.HasGrid && c.Elements[0].EnabledCount > 0);
+                var it2 = stash.Containers.First(c => c.IsTopLevel && c.HasGrid).Items.First(i => i.BaseW == 1 && i.BaseH == 1);
+                var ps = stash.FindSpot(page, 1, 1, null, -1);
+                undo.Checkpoint("move3");
+                var m3 = InvSave.Move(it2, page, ps[0], ps[1], false);
+                Console.WriteLine("move main->" + page.Title + ": " + (m3.Container.UidKey == page.UidKey) + " uid kept " + (m3.UidKey == it2.UidKey));
+                // self-containment guard
+                { var bp = inv.ItemsByUid.Values.First(i => i.IdName.Contains("Backpack")); var own = inv.ContainerOf(bp); var nestedC = inv.Containers.FirstOrDefault(c => c.OwnerItem != null && c.OwnerItem.Container == own); Console.WriteLine("backpack into own grid refused: " + inv.IsInside(own, bp) + (nestedC != null ? ", into nested container refused: " + inv.IsInside(nestedC, bp) : "") + ", into stash allowed: " + !stash.IsInside(stash.Containers.First(c => c.IsTopLevel && c.HasGrid), bp)); }
+
+                // 2) undo everything -> byte identical
+                undo.Undo(); undo.Undo(); undo.Undo();
+                Console.WriteLine("after 3x undo stash identical: " + stash.G.ToBytes().SequenceEqual(origStash) + ", inv identical: " + inv.G.ToBytes().SequenceEqual(origInv));
+                undo.Redo();
+                Console.WriteLine("redo -> stash items " + stash.ItemsByUid.Count + " inv " + inv.ItemsByUid.Count + "; can redo more: " + undo.CanRedo);
+                undo.Undo();
+
+                // 3) attach / detach weapon part
+                var w2 = inv.ItemsByUid.Values.First(i => i.Category.StartsWith("Weapons"));
+                var wmc = inv.ContainerOf(w2);
+                var occ = wmc.Items.First(i => i.Category.StartsWith("Attachments") && Catalog.Sockets.ContainsKey(Catalog.SocketKey(w2.Def, i.ContainerIndex)));
+                var si = Catalog.Sockets[Catalog.SocketKey(w2.Def, occ.ContainerIndex)];
+                var alt = si.Parts.Where(d => d != occ.Def && Catalog.Entries.ContainsKey(d)).Select(d => Catalog.Entries[d]).FirstOrDefault();
+                Console.WriteLine("socket " + si.Label + " on " + w2.DisplayName + ": " + si.Parts.Count + " known parts, current " + occ.DisplayName + ", alternative " + (alt == null ? "-" : alt.Name));
+                if (alt != null)
+                {
+                    int ci = occ.ContainerIndex; string wuid = w2.UidKey;
+                    inv.RemoveItem(occ); inv.Rebuild();
+                    w2 = inv.ItemsByUid[wuid];
+                    inv.Insert(alt.Template, inv.ContainerOf(w2), ci, si.SlotIndex, false, 0);
+                    w2 = inv.ItemsByUid[wuid];
+                    Console.WriteLine("swapped -> " + string.Join(", ", inv.ContainerOf(w2).Items.Where(i => i.ContainerIndex == ci).Select(i => i.DisplayName)) + "; issues " + inv.Validate().Count);
+                }
+                var bytes = inv.G.ToBytes(); var re = GvasFile.Parse(bytes);
+                Console.WriteLine("inventory re-encode stable: " + re.ToBytes().SequenceEqual(bytes));
+
+                // 4) gunsmith presets: duplicate + rename round-trip
+                if (gun != null)
+                {
+                    var map = (MapValue)gun.G.Root["PresetMap"];
+                    var arr = (ArrayValue)((PropList)map.Entries[0].Value)["PresetItems"];
+                    int before = arr.Items.Count;
+                    var c = ((PropList)arr.Items[0]).DeepClone(); c.Get("PresetName").Value = new FStr("Kopie test"); arr.Items.Add(c);
+                    var gb = gun.G.ToBytes(); var g2 = GvasFile.Parse(gb);
+                    var arr2 = (ArrayValue)((PropList)((MapValue)g2.Root["PresetMap"]).Entries[0].Value)["PresetItems"];
+                    Console.WriteLine("gunsmith presets " + before + " -> " + arr2.Items.Count + ", last name '" + ((PropList)arr2.Items.Last())["PresetName"] + "'");
+                }
+                return 0;
+            }
             if (args[0] == "slots")
             {
                 // print slot index -> row/col table and items of every top-level grid container
@@ -171,3 +252,4 @@ namespace IrrEditor
         }
     }
 }
+

@@ -136,8 +136,10 @@ namespace IrrEditor
     }
 
     /// <summary>One inventory-like save file (StashSaveGame / InventorySaveGame / VendorSaveGame).</summary>
-    public class InvSave
+    public class InvSave : IUndoTarget
     {
+        public GvasFile Gvas { get { return G; } set { G = value; } }
+        public bool IsDirty { get { return Dirty; } set { Dirty = value; } }
         public string Path;
         public string Kind;          // "Stash", "Inventory", "Vendor"
         public GvasFile G;
@@ -361,6 +363,69 @@ namespace IrrEditor
             return ItemsByUid[Uid.Key(root["ItemUID"])];
         }
 
+        /// <summary>Is <paramref name="mc"/> the item's own container or nested anywhere inside it?</summary>
+        public bool IsInside(MainContainer mc, InvItem it)
+        {
+            var probe = mc;
+            while (probe != null)
+            {
+                if (probe.OwnerItem == null) return false;
+                if (probe.OwnerItem == it) return true;
+                probe = probe.OwnerItem.Container;
+            }
+            return false;
+        }
+
+        /// <summary>Move an item (with everything inside it) to another container of the same save.</summary>
+        public void MoveWithin(InvItem it, MainContainer target, int elementIndex, int slot, bool rotated)
+        {
+            if (target == it.Container) { it.ContainerIndex = elementIndex; it.SlotIndex = slot; it.Rotated = rotated; Dirty = true; return; }
+            if (IsInside(target, it)) throw new InvalidOperationException("Cannot move an item into itself");
+            it.Container.ItemsArray.Items.Remove(it.P);
+            it.P.Get("MotherUID").Value = new RawValue((byte[])((RawValue)target.P["MainContainerUID"]).Data.Clone());
+            it.ContainerIndex = elementIndex; it.SlotIndex = slot; it.Rotated = rotated;
+            target.ItemsArray.Items.Add(it.P);
+            Dirty = true;
+            Rebuild();
+        }
+
+        /// <summary>Move an item to a container in any save (stash ↔ loadout). Returns the item as it exists afterwards.</summary>
+        public static InvItem Move(InvItem it, MainContainer target, int elementIndex, int slot, bool rotated)
+        {
+            var src = it.Container.Save; var dst = target.Save;
+            if (src == dst)
+            {
+                string uid = it.UidKey;
+                src.MoveWithin(it, target, elementIndex, slot, rotated);
+                return src.ItemsByUid[uid];
+            }
+            var t = src.TemplateOf(it);
+            var n = dst.Insert(t, target, elementIndex, slot, rotated, 0);
+            src.RemoveItem(it);
+            src.Rebuild();
+            return n;
+        }
+
+        /// <summary>Every container with a grid in this save, with a readable path ("Stash (main)", "Backpack › Item Case"…).</summary>
+        public List<KeyValuePair<string, MainContainer>> GridContainers()
+        {
+            var res = new List<KeyValuePair<string, MainContainer>>();
+            foreach (var mc in Containers.Where(c => c.HasGrid))
+            {
+                var parts = new List<string>();
+                var probe = mc;
+                int guard = 0;
+                while (probe != null && guard++ < 10)
+                {
+                    parts.Insert(0, probe.Title);
+                    probe = probe.OwnerItem == null ? null : probe.OwnerItem.Container;
+                    if (probe != null && probe.Label != null && !probe.HasGrid) { probe = null; } // equipment slot – its title is the item itself
+                }
+                res.Add(new KeyValuePair<string, MainContainer>(string.Join(" › ", parts.Distinct()), mc));
+            }
+            return res;
+        }
+
         public ItemTemplate TemplateOf(InvItem it)
         {
             var t = new ItemTemplate { Item = it.P.DeepClone(), Source = Kind };
@@ -407,13 +472,35 @@ namespace IrrEditor
         public int AttachmentCount;
     }
 
+    /// <summary>What has been seen attached where: (parent item definition, socket index) → part definitions.</summary>
+    public class SocketInfo
+    {
+        public string Label;                                   // e.g. "Attachments/Barrel"
+        public int SlotIndex = -1;                             // SlotIndex used by parts in this socket
+        public HashSet<string> Parts = new HashSet<string>();
+    }
+
     public static class Catalog
     {
         public static Dictionary<string, CatalogEntry> Entries = new Dictionary<string, CatalogEntry>();
+        public static Dictionary<string, SocketInfo> Sockets = new Dictionary<string, SocketInfo>();
+        public static string SocketKey(string parentDef, int ci) { return parentDef + "#" + ci; }
 
         public static void Build(IEnumerable<InvSave> saves)
         {
             Entries.Clear();
+            Sockets.Clear();
+            // compatibility learnt from every assembled item in every save (vendor stock has hundreds)
+            foreach (var s in saves)
+                foreach (var mc in s.Containers.Where(c => c.OwnerItem != null && !c.HasGrid))
+                    foreach (var part in mc.Items)
+                    {
+                        var key = SocketKey(mc.OwnerItem.Def, part.ContainerIndex);
+                        SocketInfo si;
+                        if (!Sockets.TryGetValue(key, out si)) { si = new SocketInfo { SlotIndex = part.SlotIndex }; Sockets[key] = si; }
+                        si.Parts.Add(part.Def);
+                        if (si.Label == null) si.Label = part.Category;
+                    }
             // vendor first: freshest, full-durability, fully-assembled
             foreach (var s in saves.OrderBy(x => x.Kind == "Vendor" ? 0 : 1))
                 foreach (var mc in s.Containers)
