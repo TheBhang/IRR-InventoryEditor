@@ -62,9 +62,11 @@ namespace IrrEditor
             if (d == null || d.Data.Length < 16) return new double[] { -0.5, 0.5 };
             return new[] { BitConverter.ToDouble(d.Data, 0), BitConverter.ToDouble(d.Data, 8) };
         }
-        /// <summary>Unrotated footprint in grid cells.</summary>
-        public int BaseW { get { var dim = P["ItemDimensions"] as PropList; if (dim == null) return 1; var x = V2(dim["X"]); return Math.Max(1, (int)Math.Ceiling(x[1] - x[0] - 0.001)); } }
-        public int BaseH { get { var dim = P["ItemDimensions"] as PropList; if (dim == null) return 1; var y = V2(dim["Y"]); return Math.Max(1, (int)Math.Ceiling(y[1] - y[0] - 0.001)); } }
+        /// <summary>Unrotated footprint in grid cells. The game truncates fractional extents
+        /// (a weapon stored as 5.5 × 2.5 occupies 5 × 2 cells in game), so round down.</summary>
+        public int BaseW { get { var dim = P["ItemDimensions"] as PropList; if (dim == null) return 1; var x = V2(dim["X"]); return Cells(x[1] - x[0]); } }
+        public int BaseH { get { var dim = P["ItemDimensions"] as PropList; if (dim == null) return 1; var y = V2(dim["Y"]); return Cells(y[1] - y[0]); } }
+        static int Cells(double extent) { return Math.Max(1, (int)Math.Floor(extent + 0.001)); }
         public int W { get { return Rotated ? BaseH : BaseW; } }
         public int H { get { return Rotated ? BaseW : BaseH; } }
 

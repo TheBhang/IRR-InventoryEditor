@@ -30,6 +30,33 @@ namespace IrrEditor
                 return bad;
             }
             if (args[0] == "analyze") { Analyze.Run(args[1]); return 0; }
+            if (args[0] == "slots")
+            {
+                // print slot index -> row/col table and items of every top-level grid container
+                var s = InvSave.Load(args[1], "Stash");
+                foreach (var key in s.TopUids)
+                {
+                    MainContainer mc;
+                    if (!s.ByUid.TryGetValue(key, out mc)) continue;
+                    foreach (var ge in mc.Elements.Where(e => e.IsGrid))
+                    {
+                        Console.WriteLine("== " + mc.Title + " element " + ge.Index + " rows=" + ge.Rows + " cols=" + ge.Cols + " enabled=" + ge.EnabledCount + " tier=" + ge.Tier);
+                        var sl = ge.Slots;
+                        Console.WriteLine("   first slots: " + string.Join(" ", sl.Take(12).Select(x => x["Index"] + ":" + x["Row"] + "/" + x["Column"] + ((bool)x["bEnabled"] ? "" : "x"))));
+                        Console.WriteLine("   last slots:  " + string.Join(" ", sl.Skip(Math.Max(0, sl.Count - 8)).Select(x => x["Index"] + ":" + x["Row"] + "/" + x["Column"] + ((bool)x["bEnabled"] ? "" : "x"))));
+                        foreach (var it in mc.Items.Where(i => i.ContainerIndex == ge.Index).OrderBy(i => i.SlotIndex))
+                        {
+                            var slot = sl.FirstOrDefault(x => (int)x["Index"] == it.SlotIndex);
+                            var dim = (PropList)it.P["ItemDimensions"];
+                            Func<object, string> v2 = o => { var d = ((RawValue)o).Data; return BitConverter.ToDouble(d, 0) + ".." + BitConverter.ToDouble(d, 8); };
+                            Console.WriteLine("   - slot " + it.SlotIndex + (slot != null ? " (r" + slot["Row"] + ",c" + slot["Column"] + ")" : " (no slot)") + " " + it.W + "x" + it.H + (it.Rotated ? " rot" : "")
+                                + " X=" + v2(dim["X"]) + " Y=" + v2(dim["Y"]) + " " + it.DisplayName);
+                        }
+                    }
+                }
+                foreach (var v in s.Validate()) Console.WriteLine("  ! " + v);
+                return 0;
+            }
             if (args[0] == "tools")
             {
                 string dir = args[1];
@@ -79,7 +106,7 @@ namespace IrrEditor
                     foreach (var v in s.Validate()) Console.WriteLine("   ! " + v);
                 }
                 // insert test: a weapon from catalog into main stash
-                var main = stash.Containers.First(c => c.Label == "Stash (main)");
+                var main = stash.Containers.First(c => c.IsTopLevel && c.HasGrid);
                 var wpn = Catalog.Entries.Values.Where(e => e.Category.StartsWith("Weapons")).OrderByDescending(e => e.AttachmentCount).First();
                 var spot = stash.FindSpot(main, wpn.W, wpn.H, null, -1);
                 Console.WriteLine("insert " + wpn.Name + " (" + wpn.W + "x" + wpn.H + ", +" + wpn.AttachmentCount + ") at " + (spot == null ? "none" : string.Join(",", spot)));
