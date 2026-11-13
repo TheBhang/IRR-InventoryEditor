@@ -1,0 +1,8 @@
+# build output (published as a Release instead)
+*.exe
+*.pdb
+
+# never commit game saves or editor backups
+*.sav
+*.sav.tmp
+_IRR_Editor_Backups/
